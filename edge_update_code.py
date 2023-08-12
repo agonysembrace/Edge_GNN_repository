@@ -2,7 +2,6 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 import numpy as np
 import torch
-import helper_functions
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
 from dgl.data import DGLDataset
@@ -57,7 +56,7 @@ test_B = 4
 train_K = 2
 test_K = 2
 # 训练集
-train_layouts = 2000
+train_layouts = 2
 # 测试集
 test_layouts = 200
 beta = 0.6
