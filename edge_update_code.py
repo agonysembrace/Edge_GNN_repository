@@ -32,11 +32,11 @@ device = torch.device('cpu')
 bias = True
 dimension = 64
 # 指定训练轮数
-epoch_num = 200
+epoch_num = 500
 # 指定批大小
 batch_size = 256
 # 指定学习率
-learning_rate = 5e-4
+learning_rate = 1e-4
 # 指定高斯白噪声
 var_noise = 1
 # 指定激活函数
@@ -56,7 +56,7 @@ test_B = 4
 train_K = 2
 test_K = 2
 # 训练集
-train_layouts = 2
+train_layouts = 256
 # 测试集
 test_layouts = 200
 beta = 0.6
@@ -186,8 +186,8 @@ class HetGNN(nn.Module):
     # 输入网络时，节点特征数量为batchsize*AP batchsize*UE，边特征数量为
     def forward(self, graph):
         self.preLayer(graph)
-        # for update_layer in self.update_layers:
-        #     update_layer(graph)
+        for update_layer in self.update_layers:
+            update_layer(graph)
         output = self.postprocess_layer(graph)
         output = output.view(graph.batch_size,
                             train_B,
@@ -504,7 +504,7 @@ def main():
             loss_all += loss.item() * bs
             optimizer.step()
         return loss_all / len(train_loader.dataset)
-    record = []
+    
     for epoch in range(0, epoch_num):
         if(epoch % 10 == 0):
             with torch.no_grad():
@@ -512,7 +512,6 @@ def main():
                 test_rate = test(test_loader)
             print('Epoch {:03d}, Train Rate: {:.4f}, Test Rate: {:.4f}'.format(
                 epoch, train_rate, test_rate))
-            record.append([train_rate, test_rate])
         train_rate = train(epoch)
         print('Epoch {:03d}, Train Rate: {:.4f}'.format(
                 epoch, train_rate))
