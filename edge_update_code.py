@@ -34,11 +34,11 @@ device = torch.device('cpu')
 bias = True
 dimension = 64
 # 指定训练轮数
-epoch_num = 1000
+epoch_num = 200
 # 指定批大小
 batch_size = 256
 # 指定学习率
-learning_rate = 5e-4
+learning_rate = 5e-5
 # 指定高斯白噪声
 var_noise = 1
 # 指定激活函数
@@ -58,7 +58,7 @@ test_B = 4
 train_K = 2
 test_K = 2
 # 训练集
-train_layouts = 10240
+train_layouts = 2
 # 测试集
 test_layouts = 200
 beta = 0.6
@@ -234,24 +234,6 @@ class MLP(nn.Module):
         # x = self.bn(x)
         return x
     
-class MLP_without_BN(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(MLP_without_BN, self).__init__()
-        hidden_dim = output_dim
-        self.linear1 = nn.Linear(input_dim, hidden_dim, bias)
-        self.relu1 = active_fun
-        self.linear2 = nn.Linear(hidden_dim, hidden_dim, bias)
-        self.linear3 = nn.Linear(hidden_dim, output_dim, bias)
-    
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.relu1(x)
-        x = self.linear2(x)
-        x = self.relu1(x)
-        x = self.linear3(x)
-        x = self.relu1(x)
-
-        return x
 class MLP_post(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(MLP_post, self).__init__()
@@ -299,42 +281,18 @@ class PreLayer(nn.Module):
         self.UE_pre_MLP = mlp_pre_ue
         self.EDGE_pre_MLP = mlp_pre_edge
     def forward(self, graph):
-        graph.nodes['AP'].data['feat'] = self.AP_pre_MLP(graph.nodes['AP'].data['feat'])
-        graph.nodes['UE'].data['feat'] = self.UE_pre_MLP(graph.nodes['UE'].data['feat'])
-        graph.edges['AP2UE'].data['feat'] = self.EDGE_pre_MLP(graph.edges['AP2UE'].data['feat'])
-        graph.edges['UE2AP'].data['feat'] = self.EDGE_pre_MLP(graph.edges['UE2AP'].data['feat'])
+        graph.nodes['AP'].data['hid'] = self.AP_pre_MLP(graph.nodes['AP'].data['feat'])
+        graph.nodes['UE'].data['hid'] = self.UE_pre_MLP(graph.nodes['UE'].data['feat'])
+        graph.edges['AP2UE'].data['hid'] = self.EDGE_pre_MLP(graph.edges['AP2UE'].data['feat'])
+        graph.edges['UE2AP'].data['hid'] = self.EDGE_pre_MLP(graph.edges['UE2AP'].data['feat'])
 
 class PostLayer(nn.Module):
     def __init__(self, mlp):
         super(PostLayer, self).__init__()
         self.post_mlp = mlp
     def forward(self, graph):
-        return self.post_mlp(graph.edata['feat'][('AP','AP2UE','UE')])
+        return self.post_mlp(graph.edata['new'][('AP','AP2UE','UE')])
 
-# class APConv(nn.Module):
-#     def __init__(self, mlp1, mlp2,  **kwargs):
-#         super(APConv, self).__init__()
-#         self.mlp1 = mlp1
-#         self.mlp2 = mlp2
-#     def forward(self, g):
-#         node_num = g.number_of_nodes('AP')
-#         # 对每个AP节点，获取其临边
-#         for i in range(0, node_num):
-#            # 得到出边
-#             out_edges = g.out_edges(i)
-#             AP_mlp_result = torch.zeros(len(out_edges[0]),dimension)
-#             for j in range(0, len(out_edges[0])):
-#                 # 得到出边的下标
-#                 out_edge_indices = g.edge_ids(out_edges[0][j],out_edges[1][j])
-#                 # 得到出边链接的UE特征
-#                 neighbor_ue_features = g.ndata['feat']['UE'][out_edges[1][j]]
-#                 # 得到出边上的特征
-#                 edge_feature = torch.squeeze(g.edata['feat'][out_edge_indices])
-#                 # 两个1*dimension的 进入mlp
-#                 AP_mlp_result[j,:] = self.mlp1(torch.cat((edge_feature,neighbor_ue_features),dim=-1))
-#             agg,_ = torch.max(AP_mlp_result,dim=0)
-#             g.ndata['feat']['AP'][i] = self.mlp2(
-#                 torch.cat((g.ndata['feat']['AP'][i], agg) ,dim = -1)).clone()
 class APConv(nn.Module):
     def __init__(self, mlp1, mlp2, **kwargs):
         super(APConv, self).__init__()
@@ -344,8 +302,8 @@ class APConv(nn.Module):
     def forward(self, g):
         # 对每个AP节点，获取其临边
         def message_func(edges):
-            neighbor_ue_features = edges.src['feat']
-            edge_feature = edges.data['feat']
+            neighbor_ue_features = edges.src['hid']
+            edge_feature = edges.data['hid']
             return {'neighbor_ue_features': neighbor_ue_features,
                     'edge_feature': edge_feature}
 
@@ -353,35 +311,11 @@ class APConv(nn.Module):
             AP_mlp_result = self.mlp1(torch.cat((nodes.mailbox['edge_feature'],
                                                   nodes.mailbox['neighbor_ue_features']), dim=-1))
             agg, _ = torch.max(AP_mlp_result, dim=1)
-            new_AP_feat = self.mlp2(torch.cat((nodes.data['feat'], agg), dim=-1))
-            return {'feat': new_AP_feat}
-
+            new_AP_feat = self.mlp2(torch.cat((nodes.data['hid'], agg), dim=-1))
+            return {'new': new_AP_feat}
         # g.send_and_recv(g.edges(etype=('AP','AP2UE','UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP','AP2UE','UE'))
-        g.send_and_recv(g.edges(etype=('UE', 'UE2AP', 'AP')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('UE', 'UE2AP', 'AP'))
-# class UEConv(nn.Module):
-#     def __init__(self, mlp1, mlp2,  **kwargs):
-#         super(UEConv, self).__init__()
-#         self.mlp1 = mlp1
-#         self.mlp2 = mlp2
-#     def forward(self, g):
-#         node_num = g.number_of_nodes('UE')
-#         # 对每个UE节点，获取其临边
-#         for i in range(0, node_num):
-#            # 得到入边
-#             in_edges = g.in_edges(i)
-#             UE_mlp_result = torch.zeros(len(in_edges[0]),dimension)
-#             for j in range(0, len(in_edges[0])):
-#                 # 得到入边的下标
-#                 in_edge_indices = g.edge_ids(in_edges[0][j],in_edges[1][j])
-#                 # 得到入边链接的AP特征
-#                 neighbor_ue_features = g.ndata['feat']['AP'][in_edges[1][j]]
-#                 # 得到出边上的特征
-#                 edge_feature = torch.squeeze(g.edata['feat'][in_edge_indices])
-#                 # 两个1*dimension的 进入mlp
-#                 UE_mlp_result[j,:] = self.mlp1(torch.cat((edge_feature,neighbor_ue_features),dim=-1))
-#             agg,_ = torch.max(UE_mlp_result,dim=0)
-#             g.ndata['feat']['AP'][i] = self.mlp2(
-#                 torch.cat((g.ndata['feat']['AP'][i], agg) ,dim = -1)).clone()
+        g.send_and_recv(g.edges(etype=('UE2AP')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('UE','UE2AP','AP'))
+
             
 class UEConv(nn.Module):
     def __init__(self, mlp1, mlp2, **kwargs):
@@ -392,8 +326,8 @@ class UEConv(nn.Module):
     def forward(self, g):
         # 对每个AP节点，获取其临边
         def message_func(edges):
-            neighbor_ap_features = edges.src['feat']
-            edge_feature = edges.data['feat']
+            neighbor_ap_features = edges.src['hid']
+            edge_feature = edges.data['hid']
             return {'neighbor_ap_features': neighbor_ap_features,
                     'edge_feature': edge_feature}
 
@@ -401,86 +335,140 @@ class UEConv(nn.Module):
             UE_mlp_result = self.mlp1(torch.cat((nodes.mailbox['edge_feature'],
                                                   nodes.mailbox['neighbor_ap_features']), dim=-1))
             agg, _ = torch.max(UE_mlp_result, dim=1)
-            new_UE_feat = self.mlp2(torch.cat((nodes.data['feat'], agg), dim=-1))
-            return {'feat': new_UE_feat}
+            new_UE_feat = self.mlp2(torch.cat((nodes.data['hid'], agg), dim=-1))
+            return {'new': new_UE_feat}
 
         g.send_and_recv(g.edges(etype=('AP','AP2UE','UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP','AP2UE','UE'))
-        # g.send_and_recv(g.edges(etype=('UE', 'UE2AP', 'AP')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('UE', 'UE2AP', 'AP'))
-# class EgdeConv(nn.Module):
-#     def __init__(self, mlp1, mlp2, mlp3,  **kwargs):
-#         super(EgdeConv, self).__init__()
-#         self.mlp1 = mlp1
-#         self.mlp2 = mlp2
-#         self.mlp3 = mlp3
-#     def forward(self, g):
-#         edge_num = g.number_of_edges()
-#         g.edata['feat'] = torch.zeros_like(g.edata['feat'])
-#         for i in range(0,edge_num):
-#             # 得到当前边的源节点 和 目标节点
-#             src,dst = g.find_edges(i)
-#             # 1、将源节点的特征和相关边进行拼接放入mlp1
-#             # 得到源节点的特征
-#             src_node_feature = torch.squeeze(g.ndata['feat']['AP'][src])
-#             # 源节点的所有出边(单向边，有入边吗？)
-#             out_edges = g.out_edges(src)
-#             # 对于AP的结果矩阵，-1是因为要去掉自己这条边
-#             mlp_result_AP = torch.zeros(len(out_edges[0]) - 1,dimension)
-#             # 遍历这些出边
-#             idx = 0
-#             for j in range(0,len(out_edges[0])):
-#                 # 拿到边的下标
-#                 out_edge_indices = g.edge_ids(out_edges[0][j],out_edges[1][j])
-#                 # 去掉自己
-#                 if(out_edge_indices == i):
-#                     continue
-#                 # 拿到边的特征
-#                 neighbor_edge_features = torch.squeeze(g.edata['feat'][out_edge_indices])
-#                 # 聚合，节点特征和临边特征进入mlp通通进入
-#                 mlp_result_AP[idx,:] = self.mlp1(
-#                     torch.cat((src_node_feature,neighbor_edge_features),dim = -1))
-#                 idx += 1
-#             # 2、将目标节点的特征和相关边进行拼接放入mlp2
-#             # 得到目标节点的特征
-#             dst_node_feature = torch.squeeze(g.ndata['feat']['UE'][dst])
-#             # 目标节点的所有入边
-#             in_edges = g.in_edges(dst)
-#             # 对于UE的结果矩阵，-1是因为要去掉自己这条边
-#             mlp_result_UE = torch.zeros(len(in_edges[0]) - 1,dimension)
-#             # 遍历这些出边
-#             idx = 0
-#             for j in range(0,len(in_edges[0])):
-#                 # 拿到边
-#                 in_edges = g.in_edges(dst)
-#                 # 拿到边的下标
-#                 in_edge_indices = g.edge_ids(in_edges[0][j],in_edges[1][j])
-#                 # 去掉自己
-#                 if(in_edge_indices == i):
-#                     continue
-#                 # 拿到边的特征
-#                 neighbor_edge_features = torch.squeeze(g.edata['feat'][in_edge_indices])
-#                 # 聚合，节点特征和临边特征进入mlp通通进入
-#                 mlp_result_UE[idx,:] = self.mlp2(
-#                     torch.cat((src_node_feature,neighbor_edge_features),dim = -1))
-#                 idx += 1
-#             # max 聚合
-#             agg, _ = torch.max(torch.cat((mlp_result_AP,mlp_result_UE),dim=0),dim = 0)
-#             agg = torch.squeeze(agg)
-#             g.edata['feat'][i] = self.mlp3(torch.cat((agg, g.edata['feat'][i]),dim = -1)).clone()
-#         g.edata['feat'] = g.edata['feat'].clone()
-        
-        
+
 class EgdeConv(nn.Module):
     def __init__(self, mlp1, mlp2, mlp3,  **kwargs):
         super(EgdeConv, self).__init__()
         self.mlp1 = mlp1
         self.mlp2 = mlp2
         self.mlp3 = mlp3
-    def massge_func(self, edges):
-        mlp_result = self.mlp1(torch.cat((edges.src['feat'],edges.dst['feat']),dim = -1))
-        new_edge_feat = self.mlp2(torch.cat((mlp_result, edges.data['feat']),dim=-1))
-        return {'feat':new_edge_feat}
     def forward(self, g):
-        g.apply_edges(self.massge_func,etype =('AP','AP2UE','UE'))
+        edge_num = g.number_of_edges()
+        # g.edges['AP2UE'].data['new'] = torch.zeros_like(g.edges['AP2UE'].data['hid'])
+        for i in range(0,edge_num):
+            # 得到当前边的源节点 和 目标节点
+            src,dst = g.find_edges(i)
+            # 1、将源节点的特征和相关边进行拼接放入mlp1
+            # 得到源节点的特征
+            src_node_feature = torch.squeeze(g.ndata['hid']['AP'][src])
+            # 源节点的所有出边(单向边，有入边吗？)
+            out_edges = g.out_edges(src)
+            # 对于AP的结果矩阵，-1是因为要去掉自己这条边
+            mlp_result_AP = torch.zeros(len(out_edges[0]) - 1,dimension)
+            # 遍历这些出边
+            idx = 0
+            for j in range(0,len(out_edges[0])):
+                # 拿到边的下标
+                out_edge_indices = g.edge_ids(out_edges[0][j],out_edges[1][j])
+                # 去掉自己
+                if(out_edge_indices == i):
+                    continue
+                # 拿到边的特征
+                neighbor_edge_features = torch.squeeze(g.edges['AP2UE'].data['hid'][out_edge_indices])
+                # 聚合，节点特征和临边特征进入mlp通通进入
+                mlp_result_AP[idx,:] = self.mlp1(
+                    torch.cat((src_node_feature,neighbor_edge_features),dim = -1))
+                idx += 1
+            # 2、将目标节点的特征和相关边进行拼接放入mlp2
+            # 得到目标节点的特征
+            dst_node_feature = torch.squeeze(g.ndata['hid']['UE'][dst])
+            # 目标节点的所有入边
+            in_edges = g.in_edges(dst)
+            # 对于UE的结果矩阵，-1是因为要去掉自己这条边
+            mlp_result_UE = torch.zeros(len(in_edges[0]) - 1,dimension)
+            # 遍历这些出边
+            idx = 0
+            for j in range(0,len(in_edges[0])):
+                # 拿到边
+                in_edges = g.in_edges(dst)
+                # 拿到边的下标
+                in_edge_indices = g.edge_ids(in_edges[0][j],in_edges[1][j])
+                # 去掉自己
+                if(in_edge_indices == i):
+                    continue
+                # 拿到边的特征
+                neighbor_edge_features = torch.squeeze(g.edges['AP2UE'].data['hid'][in_edge_indices])
+                # 聚合，节点特征和临边特征进入mlp通通进入
+                mlp_result_UE[idx,:] = self.mlp2(
+                    torch.cat((src_node_feature,neighbor_edge_features),dim = -1))
+                idx += 1
+            # max 聚合
+            agg, _ = torch.max(torch.cat((mlp_result_AP,mlp_result_UE),dim=0),dim = 0)
+            agg = torch.squeeze(agg)
+            g.edges['AP2UE'].data['new'][i] = self.mlp3(torch.cat((agg, g.edges['AP2UE'].data['hid'][i]),dim = -1)).clone()
+        # g.edata['feat'] = g.edata['feat'].clone()
+        g.edges['AP2UE'].data['hid'] = g.edges['AP2UE'].data['new']
+        
+        
+# class EgdeConv(nn.Module):
+#     def __init__(self, mlp1, mlp2, mlp3,  **kwargs):
+#         super(EgdeConv, self).__init__()
+#         self.mlp1 = mlp1
+#         self.mlp2 = mlp2
+#         self.mlp3 = mlp3
+#     def massge_func(self, edges):
+#         mlp_result = self.mlp1(torch.cat((edges.src['hid'],edges.dst['hid']),dim = -1))
+#         new_edge_feat = self.mlp2(torch.cat((mlp_result, edges.data['hid']),dim=-1))
+#         return {'new':new_edge_feat}
+#     def forward(self, g):
+#         g.apply_edges(self.massge_func,etype =('UE2AP'))
+#         g.apply_edges(self.massge_func,etype =('AP','AP2UE','UE'))
+#         g.edges['UE2AP'].data['hid'] = g.edges['UE2AP'].data['new']
+#         g.edges['AP2UE'].data['hid'] = g.edges['AP2UE'].data['new']
+#         g.nodes['UE'].data['hid'] = g.nodes['UE'].data['new']
+#         g.nodes['AP'].data['hid'] = g.nodes['AP'].data['new']
+
+# 流程：对于一条边来说：
+# 1、所连AP与AP的所有边（去除自己）拼接进入mlp
+# 2、所连UE与UE的所有边（去除自己) 拼接进入mlp
+# 3、所有mlp结果聚合得到agg
+# 4、和自己的边特征拼接进入mlp得到新特征
+# class EgdeConv(nn.Module):
+#     def __init__(self, mlp1, mlp2, mlp3,  **kwargs):
+#         super(EgdeConv, self).__init__()
+#         self.mlp1 = mlp1
+#         self.mlp2 = mlp2
+#         self.mlp3 = mlp3
+    
+#     def forward(self, g):
+#         # 对每个AP节点，获取其临边
+#         def message_func_ap(edges):
+#             edge_feature = edges.data['feat']
+#             return {'edge_feature': edge_feature}
+
+#         def reduce_func_ap(nodes):
+#             AP_mlp_result = self.mlp1(torch.cat((nodes.data['feat'].unsqueeze(1).expand(-1,nodes.mailbox['edge_feature'].size(1),-1),
+#                                                     nodes.mailbox['edge_feature']), dim=-1))
+#             # 每个节点存储自己临边和自己特征的聚合最大值
+#             agg, _ = torch.max(AP_mlp_result, dim=1)
+#             # 每个节点存储自己特征和邻边特征的最大拼接聚合
+#             return {'agg_ap': agg}
+#         def message_func_ue(edges):
+#             edge_feature = edges.data['feat']
+#             return {'edge_feature': edge_feature}
+
+#         def reduce_func_ue(nodes):
+#             UE_mlp_result = self.mlp1(torch.cat((nodes.data['feat'].unsqueeze(1).expand(-1,nodes.mailbox['edge_feature'].size(1),-1),
+#                                                     nodes.mailbox['edge_feature']), dim=-1))
+#             # 每个节点存储自己临边和自己特征的聚合最大值
+#             agg, _ = torch.max(UE_mlp_result, dim=1)
+#             # 每个节点存储自己特征和邻边特征的最大拼接聚合
+#             return {'agg_ue': agg}
+#         def message_func_edge(edges):
+#             agg = torch.max(torch.cat((edges.src['agg_ap'].unsqueeze(-1),edges.dst['agg_ue'].unsqueeze(-1)),dim = -1),dim = -1)[0]
+#             return {'feat': self.mlp3(torch.cat((edges.data['feat'],agg),dim = -1))}
+#         def message_func_edge_1(edges):
+#             agg = torch.max(torch.cat((edges.dst['agg_ap'].unsqueeze(-1),edges.src['agg_ue'].unsqueeze(-1)),dim = -1),dim = -1)[0]
+#             return {'feat': self.mlp3(torch.cat((edges.data['feat'],agg),dim = -1))}
+#     # g.send_and_recv(g.edges(etype=('AP','AP2UE','UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP','AP2UE','UE'))
+#         g.send_and_recv(g.edges(etype=('UE', 'UE2AP', 'AP')), message_func = message_func_ap, reduce_func = reduce_func_ap, apply_node_func = None,etype= ('UE', 'UE2AP', 'AP'))
+#         g.send_and_recv(g.edges(etype=('AP','AP2UE','UE')), message_func = message_func_ue, reduce_func = reduce_func_ue, apply_node_func = None,etype= ('AP','AP2UE','UE'))
+#         g.apply_edges(message_func_edge ,etype =('AP','AP2UE','UE'))
+#         g.apply_edges(message_func_edge_1 ,etype =('UE', 'UE2AP', 'AP'))
 
 
 # 更新层，对于节点和边的更新有着不同的策略,这与messagePassingGNN产生了明显的不同
