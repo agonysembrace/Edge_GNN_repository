@@ -34,11 +34,11 @@ device = torch.device('cpu')
 bias = True
 dimension = 64
 # 指定训练轮数
-epoch_num = 200
+epoch_num = 2000
 # 指定批大小
 batch_size = 256
 # 指定学习率
-learning_rate = 5e-4
+learning_rate = 1e-4
 # 指定高斯白噪声
 var_noise = 1
 # 指定激活函数
@@ -58,7 +58,7 @@ test_B = 4
 train_K = 2
 test_K = 2
 # 训练集
-train_layouts = 256
+train_layouts = 25600
 # 测试集
 test_layouts = 200
 beta = 0.6
@@ -573,7 +573,7 @@ def main():
             with torch.no_grad():
                 # train_rate = train(train_loader)
                 test_rate = test(test_loader)
-            print('Epoch {:03d},  Test Rate: {:.4f}'.format(
+            print('Epoch {:03d},  ——————————  Test Rate: {:.4f}'.format(
                 epoch,test_rate))
         train_rate = train(epoch)
         print('Epoch {:03d}, Train Rate: {:.4f}'.format(
