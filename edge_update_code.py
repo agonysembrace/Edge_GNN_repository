@@ -466,7 +466,7 @@ class EgdeConv(nn.Module):
         def message_func_edge(edges):
             # 获取掩码，消息的边来源不能等于当前边
             mask = torch.transpose((torch.transpose(edges.src['eid'],0,1) != edges.data['eid']),0,1)
-            
+            edges.src['ap_result'][mask]
             agg = torch.max(torch.cat((edges.src['agg_ap'].unsqueeze(-1),edges.dst['agg_ue'].unsqueeze(-1)),dim = -1),dim = -1)[0]
             return {'new': self.mlp3(torch.cat((edges.data['hid'],agg),dim = -1))}
         def message_func_edge_1(edges):
