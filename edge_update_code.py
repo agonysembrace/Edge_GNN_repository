@@ -123,7 +123,12 @@ class MyDataset(DGLDataset):
         ## UE数据为sigma^2
         graph.nodes['UE'].data['feat'] = torch.unsqueeze(1 * torch.ones(self.BK[1]),dim=-1) 
         graph.edges['AP2UE'].data['feat'] = edge_features
+        graph.edges['AP2UE'].data['eid'] = torch.arange(1,self.BK[0]*self.BK[1]+1)
         graph.edges['UE2AP'].data['feat'] = edge_features
+        graph.edges['UE2AP'].data['eid'] = torch.arange(1,self.BK[0]*self.BK[1]+1)
+
+
+        
         return graph
     # 构建出边的链接关系，表示从每一个AP到每一个UE都有连接，
     def get_cg(self):
@@ -438,7 +443,7 @@ class EgdeConv(nn.Module):
         # 对每个AP节点，获取其临边
         def message_func_ap(edges):
             edge_feature = edges.data['hid']
-            return {'edge_feature': edge_feature}
+            return {'edge_feature': edge_feature,'eid':edges.data['eid']}
 
         def reduce_func_ap(nodes):
             AP_mlp_result = self.mlp1(torch.cat((nodes.data['hid'].unsqueeze(1).expand(-1,nodes.mailbox['edge_feature'].size(1),-1),
@@ -446,7 +451,7 @@ class EgdeConv(nn.Module):
             # 每个节点存储自己临边和自己特征的聚合最大值
             agg, _ = torch.max(AP_mlp_result, dim=1)
             # 每个节点存储自己特征和邻边特征的最大拼接聚合
-            return {'agg_ap': agg}
+            return {'agg_ap': agg,'ap_result': AP_mlp_result,'eid':nodes.mailbox['eid']}
         def message_func_ue(edges):
             edge_feature = edges.data['hid']
             return {'edge_feature': edge_feature}
@@ -457,8 +462,11 @@ class EgdeConv(nn.Module):
             # 每个节点存储自己临边和自己特征的聚合最大值
             agg, _ = torch.max(UE_mlp_result, dim=1)
             # 每个节点存储自己特征和邻边特征的最大拼接聚合
-            return {'agg_ue': agg}
+            return {'agg_ue': agg,'ue_result':UE_mlp_result}
         def message_func_edge(edges):
+            # 获取掩码，消息的边来源不能等于当前边
+            mask = torch.transpose((torch.transpose(edges.src['eid'],0,1) != edges.data['eid']),0,1)
+            
             agg = torch.max(torch.cat((edges.src['agg_ap'].unsqueeze(-1),edges.dst['agg_ue'].unsqueeze(-1)),dim = -1),dim = -1)[0]
             return {'new': self.mlp3(torch.cat((edges.data['hid'],agg),dim = -1))}
         def message_func_edge_1(edges):
