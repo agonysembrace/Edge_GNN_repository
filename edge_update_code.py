@@ -34,7 +34,7 @@ device = torch.device('cpu')
 bias = True
 dimension = 64
 # 指定训练轮数
-epoch_num = 2000
+epoch_num = 500
 # 指定批大小
 batch_size = 256
 # 指定学习率
@@ -58,7 +58,7 @@ test_B = 4
 train_K = 2
 test_K = 2
 # 训练集
-train_layouts = 25600
+train_layouts = 2
 # 测试集
 test_layouts = 200
 beta = 0.6
@@ -202,8 +202,8 @@ class HetGNN(nn.Module):
             update_layer(graph)
         output = self.postprocess_layer(graph)
         output = output.view(graph.batch_size,
-                            train_B,
-                            train_K,
+                            graph.number_of_nodes('AP')//graph.batch_size,
+                            graph.number_of_nodes('UE')//graph.batch_size,
                             -1)
         output_real = output[:,:,:,0]
         output_imag = output[:,:,:,1]
@@ -569,7 +569,7 @@ def main():
         return loss_all / len(train_loader.dataset)
     
     for epoch in range(0, epoch_num):
-        if(epoch % 20 == 0):
+        if(epoch % 20 == 1):
             with torch.no_grad():
                 # train_rate = train(train_loader)
                 test_rate = test(test_loader)
@@ -589,6 +589,7 @@ def main():
         bs = len(g.nodes['UE'].data['feat'])//K
       
         output = model(g)
+        print(output)
         # scipy.io.savemat('beamformer.mat',{'beamformer':record.detach().cpu().numpy()})
         gnn_rates = rate_loss(output, rel, ima, True).flatten().detach().cpu().numpy()
         full = 0.5*torch.ones_like(output)
