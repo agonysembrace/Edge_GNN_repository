@@ -58,7 +58,7 @@ test_B = 4
 train_K = 2
 test_K = 2
 # 训练集
-train_layouts = 2
+train_layouts = 51200
 # 测试集
 test_layouts = 200
 beta = 0.6
@@ -76,20 +76,20 @@ scipy.io.savemat('test_channel.mat',{'test_channel':test_channel_rel + 1j* test_
 # train_channel = scipy.io.loadmat('test_200_channel.mat')
 # test_channel_rel = np.transpose(np.real(train_channel['Hd1']),axes=(0, 2, 1))
 # test_channel_ima = np.transpose(np.imag(train_channel['Hd1']),axes=(0, 2, 1))
-def normalize_data(data):
-    data_mean = torch.mean(data, dim=0)
-    data_std = torch.std(data, dim=0)
-    norm_data = (data - data_mean) / data_std
-    return norm_data
+# def normalize_data(data):
+#     data_mean = torch.mean(data, dim=0)
+#     data_std = torch.std(data, dim=0)
+#     norm_data = (data - data_mean) / data_std
+#     return norm_data
 
 
-def normalize_data(train_data,test_data):
-    train_mean = np.mean(train_data)
-    train_std = np.std(train_data)
-    norm_train = (train_data)/train_std
-    norm_test = (test_data)/train_std
-    n1, n2 = norm_train.shape[0], norm_test.shape[0]
-    return norm_train, norm_test
+# def normalize_data(train_data,test_data):
+#     train_mean = np.mean(train_data)
+#     train_std = np.std(train_data)
+#     norm_train = (train_data)/train_std
+#     norm_test = (test_data)/train_std
+#     n1, n2 = norm_train.shape[0], norm_test.shape[0]
+#     return norm_train, norm_test
 # test_channel_rel, test_channel_ima = normalize_data(test_channel_rel, test_channel_ima)
 
 def normalize_one_tensor(tensor):
@@ -112,7 +112,7 @@ class MyDataset(DGLDataset):
         edge_feature_rel = self.rel[idx,:,:].reshape((self.BK[0]*self.BK[1],1))
         edge_feature_ima = self.ima[idx,:,:].reshape((self.BK[0]*self.BK[1],1))
         # edge_features = (torch.tensor(np.concatenate((edge_feature_rel, edge_feature_ima), axis = -1), dtype = torch.float))
-        # 归一化带来巨大提升
+        # 归一化
         edge_features = normalize_one_tensor(torch.tensor(np.concatenate((edge_feature_rel, edge_feature_ima), axis = -1), dtype = torch.float))
 
         graph = dgl.heterograph( {('AP','AP2UE','UE'): self.adj,
@@ -126,9 +126,6 @@ class MyDataset(DGLDataset):
         graph.edges['AP2UE'].data['eid'] = torch.arange(1,self.BK[0]*self.BK[1]+1)
         graph.edges['UE2AP'].data['feat'] = edge_features
         graph.edges['UE2AP'].data['eid'] = torch.arange(1,self.BK[0]*self.BK[1]+1)
-
-
-        
         return graph
     # 构建出边的链接关系，表示从每一个AP到每一个UE都有连接，
     def get_cg(self):
@@ -227,14 +224,22 @@ class MLP(nn.Module):
         self.relu1 = active_fun
         self.linear2 = nn.Linear(hidden_dim, hidden_dim, bias)
         self.linear3 = nn.Linear(hidden_dim, output_dim, bias)
-        self.bn = nn.BatchNorm1d(hidden_dim)
+        self.bn = nn.BatchNorm1d(output_dim)
+        self.ln = nn.LayerNorm(output_dim)
     
     def forward(self, x):
+        
         x = self.linear1(x)
-        x = self.relu1(x)
-        x = self.linear2(x)
-        x = self.relu1(x)
-        x = self.linear3(x)
+        # x = self.relu1(x)
+        # x = self.linear2(x)
+        # x = self.relu1(x)
+        # x = self.linear3(x)
+        # x = self.ln(x)
+        shape = x.size()
+        if(len(shape)>2):
+            for i in range (shape[1]):
+                tmp = x[:,i,:].clone()
+                x[:,i,:] = self.bn(tmp.squeeze()).clone()
         x = self.relu1(x)
         # x = self.bn(x)
         return x
@@ -251,6 +256,7 @@ class MLP_One_Layer(nn.Module):
         super(MLP_One_Layer, self).__init__()
         self.linear1 = nn.Linear(input_dim, output_dim, bias)
         self.active_fun = active_fun
+        self.bn = nn.BatchNorm1d(output_dim)
     
     def forward(self, x):
         x = self.linear1(x)
@@ -296,7 +302,7 @@ class PostLayer(nn.Module):
         super(PostLayer, self).__init__()
         self.post_mlp = mlp
     def forward(self, graph):
-        return self.post_mlp(graph.edata['new'][('AP','AP2UE','UE')])
+        return self.post_mlp(graph.edata['hid'][('AP','AP2UE','UE')])
 
 class APConv(nn.Module):
     def __init__(self, mlp1, mlp2, **kwargs):
@@ -315,6 +321,7 @@ class APConv(nn.Module):
         def reduce_func(nodes):
             AP_mlp_result = self.mlp1(torch.cat((nodes.mailbox['edge_feature'],
                                                   nodes.mailbox['neighbor_ue_features']), dim=-1))
+            # 聚合邻居ue数据，取Max
             agg, _ = torch.max(AP_mlp_result, dim=1)
             new_AP_feat = self.mlp2(torch.cat((nodes.data['hid'], agg), dim=-1))
             return {'new': new_AP_feat}
@@ -329,7 +336,7 @@ class UEConv(nn.Module):
         self.mlp2 = mlp2
 
     def forward(self, g):
-        # 对每个AP节点，获取其临边
+        # 对每个UE节点，获取其临边
         def message_func(edges):
             neighbor_ap_features = edges.src['hid']
             edge_feature = edges.data['hid']
@@ -343,7 +350,7 @@ class UEConv(nn.Module):
             new_UE_feat = self.mlp2(torch.cat((nodes.data['hid'], agg), dim=-1))
             return {'new': new_UE_feat}
 
-        g.send_and_recv(g.edges(etype=('AP','AP2UE','UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP','AP2UE','UE'))
+        g.send_and_recv(g.edges(etype=('AP2UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP','AP2UE','UE'))
 
 # class EgdeConv(nn.Module):
 #     def __init__(self, mlp1, mlp2, mlp3,  **kwargs):
@@ -449,34 +456,38 @@ class EgdeConv(nn.Module):
             AP_mlp_result = self.mlp1(torch.cat((nodes.data['hid'].unsqueeze(1).expand(-1,nodes.mailbox['edge_feature'].size(1),-1),
                                                     nodes.mailbox['edge_feature']), dim=-1))
             # 每个节点存储自己临边和自己特征的聚合最大值
-            agg, _ = torch.max(AP_mlp_result, dim=1)
+            # agg, _ = torch.max(AP_mlp_result, dim=1)
             # 每个节点存储自己特征和邻边特征的最大拼接聚合
-            return {'agg_ap': agg,'ap_result': AP_mlp_result,'eid':nodes.mailbox['eid']}
+            return {'ap_result': AP_mlp_result,'eid':nodes.mailbox['eid']}
         def message_func_ue(edges):
             edge_feature = edges.data['hid']
-            return {'edge_feature': edge_feature}
+            return {'edge_feature': edge_feature,'eid':edges.data['eid']}
 
         def reduce_func_ue(nodes):
             UE_mlp_result = self.mlp1(torch.cat((nodes.data['hid'].unsqueeze(1).expand(-1,nodes.mailbox['edge_feature'].size(1),-1),
                                                     nodes.mailbox['edge_feature']), dim=-1))
             # 每个节点存储自己临边和自己特征的聚合最大值
-            agg, _ = torch.max(UE_mlp_result, dim=1)
+            # agg, _ = torch.max(UE_mlp_result, dim=1)
             # 每个节点存储自己特征和邻边特征的最大拼接聚合
-            return {'agg_ue': agg,'ue_result':UE_mlp_result}
+            return {'ue_result':UE_mlp_result,'eid':nodes.mailbox['eid']}
         def message_func_edge(edges):
             # 获取掩码，消息的边来源不能等于当前边
-            mask = torch.transpose((torch.transpose(edges.src['eid'],0,1) != edges.data['eid']),0,1)
-            edges.src['ap_result'][mask]
-            agg = torch.max(torch.cat((edges.src['agg_ap'].unsqueeze(-1),edges.dst['agg_ue'].unsqueeze(-1)),dim = -1),dim = -1)[0]
-            return {'new': self.mlp3(torch.cat((edges.data['hid'],agg),dim = -1))}
-        def message_func_edge_1(edges):
-            agg = torch.max(torch.cat((edges.dst['agg_ap'].unsqueeze(-1),edges.src['agg_ue'].unsqueeze(-1)),dim = -1),dim = -1)[0]
+            mask_ap = torch.transpose((torch.transpose(edges.src['eid'],0,1) == edges.data['eid']),0,1)
+            mask_ap = mask_ap.unsqueeze(-1).expand(-1,-1,dimension)
+            ap_info = edges.src['ap_result']
+            ap_info[mask_ap] = 0
+            mask_ue = torch.transpose((torch.transpose(edges.dst['eid'],0,1) == edges.data['eid']),0,1)
+            mask_ue = mask_ue.unsqueeze(-1).expand(-1,-1,dimension)
+            ue_info = edges.dst['ue_result']
+            ue_info[mask_ue] = 0
+            agg = torch.max(torch.cat((ap_info,ue_info),dim = 1),dim = 1)[0]
             return {'new': self.mlp3(torch.cat((edges.data['hid'],agg),dim = -1))}
     # g.send_and_recv(g.edges(etype=('AP','AP2UE','UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP','AP2UE','UE'))
         g.send_and_recv(g.edges(etype=('UE', 'UE2AP', 'AP')), message_func = message_func_ap, reduce_func = reduce_func_ap, apply_node_func = None,etype= ('UE', 'UE2AP', 'AP'))
         g.send_and_recv(g.edges(etype=('AP','AP2UE','UE')), message_func = message_func_ue, reduce_func = reduce_func_ue, apply_node_func = None,etype= ('AP','AP2UE','UE'))
         g.apply_edges(message_func_edge ,etype =('AP','AP2UE','UE'))
-        g.apply_edges(message_func_edge_1 ,etype =('UE', 'UE2AP', 'AP'))
+        # g.apply_edges(message_func_edge_1 ,etype =('UE', 'UE2AP', 'AP'))
+        g.edges['UE2AP'].data['new'] = g.edges['AP2UE'].data['new']
         g.nodes['UE'].data['hid'] = g.nodes['UE'].data['new']
         g.nodes['AP'].data['hid'] = g.nodes['AP'].data['new']
         g.edges['UE2AP'].data['hid'] = g.edges['UE2AP'].data['new']
@@ -491,9 +502,6 @@ class UpdateLayer(nn.Module):
         self.APConv = APConv(mlp_update_1, mlp_update_2)
         self.UEConv = UEConv(mlp_update_3, mlp_update_4)
         self.EgdeConv = EgdeConv(mlp_update_5,mlp_update_6,mlp_update_7)
-        
-        # self.max_aggregator = MaxAggregator()
-        # self.mlp = MLP(hidden_dim * 2, hidden_dim)
     
     def forward(self, graph):
         self.APConv(graph)
@@ -569,7 +577,7 @@ def main():
             output = model(g)
             loss = rate_loss(output, rel, ima)
             
-            # loss.requires_grad_(True)
+            loss.requires_grad_(True)
             loss.backward()
         
             loss_all += loss.item() * bs
@@ -581,11 +589,9 @@ def main():
             with torch.no_grad():
                 # train_rate = train(train_loader)
                 test_rate = test(test_loader)
-            print('Epoch {:03d},  ——————————  Test Rate: {:.4f}'.format(
-                epoch,test_rate))
+            print('Epoch {:03d},  ——————————  Test Rate: {:.4f}'.format(epoch,test_rate))
         train_rate = train(epoch)
-        print('Epoch {:03d}, Train Rate: {:.4f}'.format(
-                epoch, train_rate))
+        print('Epoch {:03d}, Train Rate: {:.4f}'.format(epoch, train_rate))
         scheduler.step()
 
     # beamformer= torch.zeros()
