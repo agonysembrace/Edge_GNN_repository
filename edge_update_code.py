@@ -58,7 +58,7 @@ test_B = 4
 train_K = 2
 test_K = 2
 # 训练集
-train_layouts = 51200
+train_layouts = 25600
 # 测试集
 test_layouts = 200
 beta = 0.6
@@ -209,6 +209,7 @@ class HetGNN(nn.Module):
                             -1)
         output_real = output[:,:,:,0]
         output_imag = output[:,:,:,1]
+        # P_max = 1
         norm_output_real,norm_output_imag = norm_func(output_real, output_imag)
         norm_output = torch.cat((torch.unsqueeze(norm_output_real,dim = 3),
                                  torch.unsqueeze(norm_output_imag,dim = 3)),dim = 3)
@@ -230,17 +231,17 @@ class MLP(nn.Module):
     def forward(self, x):
         
         x = self.linear1(x)
-        # x = self.relu1(x)
-        # x = self.linear2(x)
-        # x = self.relu1(x)
-        # x = self.linear3(x)
-        # x = self.ln(x)
-        shape = x.size()
-        if(len(shape)>2):
-            for i in range (shape[1]):
-                tmp = x[:,i,:].clone()
-                x[:,i,:] = self.bn(tmp.squeeze()).clone()
         x = self.relu1(x)
+        x = self.linear2(x)
+        x = self.relu1(x)
+        x = self.linear3(x)
+        # x = self.ln(x)
+        # shape = x.size()
+        # if(len(shape)>2):
+        #     for i in range (shape[1]):
+        #         tmp = x[:,i,:].clone()
+        #         x[:,i,:] = self.bn(tmp.squeeze()).clone()
+        # x = self.relu1(x)
         # x = self.bn(x)
         return x
     
