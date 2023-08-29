@@ -60,7 +60,7 @@ test_K = 2
 # 训练集
 train_layouts = 25600
 # 测试集
-test_layouts = 200
+test_layouts = 256
 beta = 0.6
 
 # 创建信道，因为不能直接输入复数进入神经网络，我们输入信道的模值
@@ -241,8 +241,11 @@ class MLP(nn.Module):
         #     for i in range (shape[1]):
         #         tmp = x[:,i,:].clone()
         #         x[:,i,:] = self.bn(tmp.squeeze()).clone()
-        # x = self.relu1(x)
-        # x = self.bn(x)
+        x = self.relu1(x)
+        shape = x.size()
+        x = x.view(-1,shape[-1])
+        x = self.bn(x)
+        x = x.view(shape)
         return x
     
 class MLP_post(nn.Module):
@@ -262,6 +265,11 @@ class MLP_One_Layer(nn.Module):
     def forward(self, x):
         x = self.linear1(x)
         x = self.active_fun(x)
+     
+        shape = x.size()
+        x = x.view(-1,shape[-1])
+        x = self.bn(x)
+        x = x.view(shape)
         return x
 
 # 本网络中的mlp涉及到多个，每一个mlp应该为不同的实例，这样才能保证参数分别进行更新
@@ -465,7 +473,7 @@ class EgdeConv(nn.Module):
             return {'edge_feature': edge_feature,'eid':edges.data['eid']}
 
         def reduce_func_ue(nodes):
-            UE_mlp_result = self.mlp1(torch.cat((nodes.data['hid'].unsqueeze(1).expand(-1,nodes.mailbox['edge_feature'].size(1),-1),
+            UE_mlp_result = self.mlp2(torch.cat((nodes.data['hid'].unsqueeze(1).expand(-1,nodes.mailbox['edge_feature'].size(1),-1),
                                                     nodes.mailbox['edge_feature']), dim=-1))
             # 每个节点存储自己临边和自己特征的聚合最大值
             # agg, _ = torch.max(UE_mlp_result, dim=1)
