@@ -34,11 +34,11 @@ device = torch.device('cpu')
 bias = True
 dimension = 64
 # 指定训练轮数
-epoch_num = 500
+epoch_num = 50
 # 指定批大小
-batch_size = 256
+batch_size = 512
 # 指定学习率
-learning_rate = 1e-4
+learning_rate = 1e-3
 # 指定高斯白噪声
 var_noise = 1
 # 指定激活函数
@@ -58,10 +58,11 @@ test_B = 4
 train_K = 2
 test_K = 2
 # 训练集
-train_layouts = 25600
+train_layouts = 51200
 # 测试集
 test_layouts = 256
 beta = 0.6
+hid_dim = 128
 
 # 创建信道，因为不能直接输入复数进入神经网络，我们输入信道的模值
 # 创建信道实部
@@ -76,21 +77,6 @@ scipy.io.savemat('test_channel.mat',{'test_channel':test_channel_rel + 1j* test_
 # train_channel = scipy.io.loadmat('test_200_channel.mat')
 # test_channel_rel = np.transpose(np.real(train_channel['Hd1']),axes=(0, 2, 1))
 # test_channel_ima = np.transpose(np.imag(train_channel['Hd1']),axes=(0, 2, 1))
-# def normalize_data(data):
-#     data_mean = torch.mean(data, dim=0)
-#     data_std = torch.std(data, dim=0)
-#     norm_data = (data - data_mean) / data_std
-#     return norm_data
-
-
-# def normalize_data(train_data,test_data):
-#     train_mean = np.mean(train_data)
-#     train_std = np.std(train_data)
-#     norm_train = (train_data)/train_std
-#     norm_test = (test_data)/train_std
-#     n1, n2 = norm_train.shape[0], norm_test.shape[0]
-#     return norm_train, norm_test
-# test_channel_rel, test_channel_ima = normalize_data(test_channel_rel, test_channel_ima)
 
 def normalize_one_tensor(tensor):
     min_val = torch.min(tensor)
@@ -220,12 +206,13 @@ class HetGNN(nn.Module):
 class MLP(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(MLP, self).__init__()
-        hidden_dim = output_dim
+        hidden_dim = hid_dim
         self.linear1 = nn.Linear(input_dim, hidden_dim, bias)
         self.relu1 = active_fun
         self.linear2 = nn.Linear(hidden_dim, hidden_dim, bias)
         self.linear3 = nn.Linear(hidden_dim, output_dim, bias)
-        self.bn = nn.BatchNorm1d(output_dim)
+        self.bn = nn.BatchNorm1d(output_dim,momentum=0.01,)
+        # self.bn2 = nn.BatchNorm1d(output_dim,momentum=0.05,)
         self.ln = nn.LayerNorm(output_dim)
     
     def forward(self, x):
@@ -246,6 +233,10 @@ class MLP(nn.Module):
         x = x.view(-1,shape[-1])
         x = self.bn(x)
         x = x.view(shape)
+        # if(len(shape)>2):
+        #     for i in range (shape[1]):
+        #         tmp = x[:,i,:].clone()
+        #         x[:,i,:] = self.bn(tmp.squeeze()).clone()
         return x
     
 class MLP_post(nn.Module):
@@ -265,11 +256,11 @@ class MLP_One_Layer(nn.Module):
     def forward(self, x):
         x = self.linear1(x)
         x = self.active_fun(x)
-     
-        shape = x.size()
-        x = x.view(-1,shape[-1])
         x = self.bn(x)
-        x = x.view(shape)
+        # shape = x.size()
+        # x = x.view(-1,shape[-1])
+        # x = self.bn(x)
+        # x = x.view(shape)
         return x
 
 # 本网络中的mlp涉及到多个，每一个mlp应该为不同的实例，这样才能保证参数分别进行更新
@@ -331,7 +322,9 @@ class APConv(nn.Module):
             AP_mlp_result = self.mlp1(torch.cat((nodes.mailbox['edge_feature'],
                                                   nodes.mailbox['neighbor_ue_features']), dim=-1))
             # 聚合邻居ue数据，取Max
-            agg, _ = torch.max(AP_mlp_result, dim=1)
+            # agg, _ = torch.max(AP_mlp_result, dim=1)
+            agg = torch.sum(AP_mlp_result, dim=1)
+
             new_AP_feat = self.mlp2(torch.cat((nodes.data['hid'], agg), dim=-1))
             return {'new': new_AP_feat}
         # g.send_and_recv(g.edges(etype=('AP','AP2UE','UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP','AP2UE','UE'))
@@ -355,11 +348,13 @@ class UEConv(nn.Module):
         def reduce_func(nodes):
             UE_mlp_result = self.mlp1(torch.cat((nodes.mailbox['edge_feature'],
                                                   nodes.mailbox['neighbor_ap_features']), dim=-1))
-            agg, _ = torch.max(UE_mlp_result, dim=1)
+            # agg, _ = torch.max(UE_mlp_result, dim=1)
+            agg = torch.sum(UE_mlp_result, dim=1)
+
             new_UE_feat = self.mlp2(torch.cat((nodes.data['hid'], agg), dim=-1))
             return {'new': new_UE_feat}
 
-        g.send_and_recv(g.edges(etype=('AP2UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP','AP2UE','UE'))
+        g.send_and_recv(g.edges(etype=('AP2UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP2UE'))
 
 # class EgdeConv(nn.Module):
 #     def __init__(self, mlp1, mlp2, mlp3,  **kwargs):
@@ -489,7 +484,8 @@ class EgdeConv(nn.Module):
             mask_ue = mask_ue.unsqueeze(-1).expand(-1,-1,dimension)
             ue_info = edges.dst['ue_result']
             ue_info[mask_ue] = 0
-            agg = torch.max(torch.cat((ap_info,ue_info),dim = 1),dim = 1)[0]
+            # agg = torch.max(torch.cat((ap_info,ue_info),dim = 1),dim = 1)[0]
+            agg = torch.sum(torch.cat((ap_info,ue_info),dim = 1),dim = 1)
             return {'new': self.mlp3(torch.cat((edges.data['hid'],agg),dim = -1))}
     # g.send_and_recv(g.edges(etype=('AP','AP2UE','UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP','AP2UE','UE'))
         g.send_and_recv(g.edges(etype=('UE', 'UE2AP', 'AP')), message_func = message_func_ap, reduce_func = reduce_func_ap, apply_node_func = None,etype= ('UE', 'UE2AP', 'AP'))
@@ -540,11 +536,11 @@ hetgnn_model = HetGNN()
 
 model = hetgnn_model
 
-# optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,weight_decay=1e-3)
+# optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate)
 # optimizer = torch.optim.RMSprop(model.parameters(), lr=0.00001)
 
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.9)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.98,)
 
 
 
@@ -553,6 +549,8 @@ def test(loader):
     model.eval()
     correct = 0
     for (g, rel, ima) in loader:
+        optimizer.zero_grad()
+
         K = rel.shape[-1] # 6
         bs = len(g.nodes['UE'].data['feat'])//K
         output = model(g)
@@ -572,21 +570,19 @@ def main():
     
     train_loader = DataLoader(train_data, batch_size, shuffle=True, collate_fn=collate)
     # train_loader = DataLoader(train_data, batch_size, shuffle=True, collate_fn=collate,num_workers=4,pin_memory=True)、
-    test_loader = DataLoader(test_data, test_layouts, shuffle=False, collate_fn=collate)
+    test_loader = DataLoader(test_data, test_layouts, shuffle=True, collate_fn=collate)
     def train(epoch):
         """ Train for one epoch. """
         model.train()
         loss_all = 0
         for batch_idx, (g, rel, ima) in enumerate(train_loader):
-            optimizer.zero_grad()
-            #data = data 
             K = rel.shape[-1] # 6
             bs = len(g.nodes['UE'].data['feat'])//K
-            
             output = model(g)
             loss = rate_loss(output, rel, ima)
-            
-            loss.requires_grad_(True)
+            # loss.requires_grad_(True)
+            optimizer.zero_grad()
+
             loss.backward()
         
             loss_all += loss.item() * bs
@@ -594,7 +590,7 @@ def main():
         return loss_all / len(train_loader.dataset)
     
     for epoch in range(0, epoch_num):
-        if(epoch % 20 == 1):
+        if(epoch % 10 == 1):
             with torch.no_grad():
                 # train_rate = train(train_loader)
                 test_rate = test(test_loader)
