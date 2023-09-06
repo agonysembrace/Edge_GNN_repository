@@ -32,11 +32,11 @@ print(torch.cuda.is_available())
 # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 device = torch.device('cpu')
 bias = True
-dimension = 64
+dimension = 16
 # 指定训练轮数
-epoch_num = 50
+epoch_num = 20
 # 指定批大小
-batch_size = 512
+batch_size = 200
 # 指定学习率
 learning_rate = 1e-3
 # 指定高斯白噪声
@@ -58,11 +58,11 @@ test_B = 4
 train_K = 2
 test_K = 2
 # 训练集
-train_layouts = 51200
+train_layouts = 25600
 # 测试集
-test_layouts = 256
+test_layouts = 200
 beta = 0.6
-hid_dim = 128
+hid_dim = 64
 
 # 创建信道，因为不能直接输入复数进入神经网络，我们输入信道的模值
 # 创建信道实部
@@ -74,9 +74,9 @@ train_channel_ima = beta * np.random.randn(train_layouts, train_B, train_K)
 test_channel_rel = beta * np.random.randn(test_layouts, test_B, test_K)
 test_channel_ima = beta * np.random.randn(test_layouts, test_B, test_K)
 scipy.io.savemat('test_channel.mat',{'test_channel':test_channel_rel + 1j* test_channel_ima})
-# train_channel = scipy.io.loadmat('test_200_channel.mat')
-# test_channel_rel = np.transpose(np.real(train_channel['Hd1']),axes=(0, 2, 1))
-# test_channel_ima = np.transpose(np.imag(train_channel['Hd1']),axes=(0, 2, 1))
+train_channel = scipy.io.loadmat('test_200_channel.mat')
+test_channel_rel = np.transpose(np.real(train_channel['Hd1']),axes=(0, 2, 1))
+test_channel_ima = np.transpose(np.imag(train_channel['Hd1']),axes=(0, 2, 1))
 
 def normalize_one_tensor(tensor):
     min_val = torch.min(tensor)
@@ -608,7 +608,7 @@ def main():
         bs = len(g.nodes['UE'].data['feat'])//K
       
         output = model(g)
-        print(output)
+        # print(output)
         # scipy.io.savemat('beamformer.mat',{'beamformer':record.detach().cpu().numpy()})
         gnn_rates = rate_loss(output, rel, ima, True).flatten().detach().cpu().numpy()
         full = 0.5*torch.ones_like(output)
@@ -618,7 +618,7 @@ def main():
 
     # scipy.io.savemat('beamformer.mat',{'beamformer':beamformer})
     scipy.io.savemat('gnn_rate.mat',{'gnn_rate':gnn_rates})
-    scipy.io.savemat('all_one_rates',{'all_one_rates':all_one_rates})
+    scipy.io.savemat('all_one_rates.mat',{'all_one_rates':all_one_rates})
 
     # min_rate, max_rate = 0, 10
     y_axis = np.arange(0, 1.0, 1/test_layouts)
