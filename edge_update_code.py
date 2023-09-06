@@ -32,7 +32,7 @@ print(torch.cuda.is_available())
 # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 device = torch.device('cpu')
 bias = True
-dimension = 16
+dimension = 64
 # 指定训练轮数
 epoch_num = 20
 # 指定批大小
