@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 # 更新node： 
 # 对于每一个AP: 邻居node 1*dim，邻居边：2*dim，合并起来进mlp，->3*dim，所有结果聚合 ->1*dim，和自己拼接进mlp ->2*dim,输出 1*dim
 # 对于每一个UE: 同理
-# 对于每一条边: ……
+# 对于每一条边: …….
 # torch.autograd.set_detect_anomaly(True)
 # torch.autograd.set_detect_anomaly(True)
 
@@ -29,12 +29,14 @@ print(torch.__version__)
 print(torch.version.cuda)
 print(torch.backends.cudnn.version())
 print(torch.cuda.is_available())
+torch.set_printoptions(precision=8)
 # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 device = torch.device('cpu')
+# torch.set_default_dtype(torch.double)
 bias = True
-dimension = 16
+dimension = 64
 # 指定训练轮数
-epoch_num = 20
+epoch_num = 5000
 # 指定批大小
 batch_size = 200
 # 指定学习率
@@ -47,8 +49,10 @@ var_noise = 1
 active_fun = nn.ReLU()
 # 瑞丽信道系数
 c = 1/np.sqrt(2)
-# PowerBudget
+# PowerBudget /W
 P_max = 1
+# backhaulBudget /bps
+C_max = 1.1
 # sigma
 sigma = var_noise
 # AP数量，单天线 train和test显然是可以不一样的
@@ -58,11 +62,15 @@ test_B = 4
 train_K = 2
 test_K = 2
 # 训练集
-train_layouts = 25600
+train_layouts = 200
 # 测试集
 test_layouts = 200
+# 模拟路损
 beta = 0.6
+
 hid_dim = 64
+# 指示函数因子
+delta = 1e-5
 
 # 创建信道，因为不能直接输入复数进入神经网络，我们输入信道的模值
 # 创建信道实部
@@ -100,7 +108,6 @@ class MyDataset(DGLDataset):
         # edge_features = (torch.tensor(np.concatenate((edge_feature_rel, edge_feature_ima), axis = -1), dtype = torch.float))
         # 归一化
         edge_features = normalize_one_tensor(torch.tensor(np.concatenate((edge_feature_rel, edge_feature_ima), axis = -1), dtype = torch.float))
-
         graph = dgl.heterograph( {('AP','AP2UE','UE'): self.adj,
                                   ('UE','UE2AP','AP'): self.adj_t}) 
         
@@ -151,15 +158,17 @@ def rate_loss(beamformer, rel, ima, test_mode = False):
 
     beamformer_all = beamformer[:, :, :, 0].float() + 1j * beamformer[:, :, :, 1].float() 
     channel_all = rel.float() + 1j * ima.float() 
+    B_cur = beamformer.size()[1]
+    K_cur = beamformer.size()[2]
     batch_cur = rel.shape[0]
-    SINRs_numerators = torch.zeros((batch_cur, train_K)) 
-    SINRs_denominators = torch.zeros(batch_cur, train_K) 
+    SINRs_numerators = torch.zeros((batch_cur, K_cur)) 
+    SINRs_denominators = torch.zeros(batch_cur, K_cur) 
     # 分子，表示有用信号
-    for i in range(0, train_K):
+    for i in range(0, K_cur):
             SINRs_numerators[:,i] = torch.squeeze(torch.abs(torch.matmul(beamformer_all[:,:,i].unsqueeze(1), torch.transpose(channel_all[:,:,i].unsqueeze(1),dim0=1,dim1=2))) ** 2)
     # 分母是干扰波束*自己的信道
-    for i in range(0, train_K):
-            for j in range(0, train_K):
+    for i in range(0, K_cur):
+            for j in range(0, K_cur):
                 if(i != j):
                     # bb = beamformer_all[b,:,j].unsqueeze(0)
                     # bbb = torch.transpose(channel_all[b,:,i].unsqueeze(0),0,1)
@@ -169,11 +178,26 @@ def rate_loss(beamformer, rel, ima, test_mode = False):
     rates = torch.log2(1 + SINRs) 
     sum_rate = torch.sum(rates, dim = 1)  # take sum
     # sum_rate = torch.min(rates, dim = 1)[0]  # take sum
+    # 计算每个AP的backhaul放入目标函数
+    backhaul = torch.zeros(batch_cur,B_cur)
+    for i in range(0, B_cur):
+        for k in range(0,K_cur):
+            # backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))*rates[:,k]
+            backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))
+    # sum_rate = 0*sum_rate
+    # sum_rate -= 10000*torch.norm(beamformer_all,dim = (1,2))
+    # sum_rate -= 1000*torch.sum(torch.abs(torch.log(torch.norm(beamformer_all,dim = (2))/delta+1)/torch.log(torch.tensor(1/delta+1))-C_max),dim=1)
+    # sum_rate -= 1000*torch.abs(torch.sum((torch.norm(beamformer_all,dim = (2))/(delta+torch.norm(beamformer_all,dim = (2)))),dim=1)-C_max)
+    # sum_rate -= torch.sum( 10* (backhaul),dim = 1)
+    sum_rate -= torch.sum( 10* torch.abs(backhaul-C_max),dim = 1)
+    # sum_rate -= torch.sum( 10* (backhaul-C_max),dim = 1)
     if test_mode:
         return sum_rate
     else:
         return -torch.mean(sum_rate)
-    
+def caculate_backhaul(beamformer):
+    backhaul = torch.log(torch.norm(torch.tensor(beamformer),dim = 1)/delta+1)/torch.log(torch.tensor(1/delta+1))
+    return backhaul
 # 定义整体的神经网络结构，输入层MLP（将数据转换成APnode、UEnode、edge，维度全是64）->多个中间更新层MLP（保持维度为64）->输出层MLP
 class HetGNN(nn.Module):
     def __init__(self):
@@ -196,10 +220,13 @@ class HetGNN(nn.Module):
         output_real = output[:,:,:,0]
         output_imag = output[:,:,:,1]
         # P_max = 1
-        norm_output_real,norm_output_imag = norm_func(output_real, output_imag)
+        norm_output_real, norm_output_imag = output_real, output_imag
+        # norm_output_real, norm_output_imag = norm_func(output_real, output_imag)
+        # norm_output_real = MyBinaryMaskLayer.forward(norm_output_real)
+        # norm_output_imag = MyBinaryMaskLayer.forward(norm_output_imag)
         norm_output = torch.cat((torch.unsqueeze(norm_output_real,dim = 3),
                                  torch.unsqueeze(norm_output_imag,dim = 3)),dim = 3)
-        
+        # norm_output = MyBinaryMaskLayer.forward(norm_output)
         return norm_output
     
 # 本网络中的所有MLP保持为3个线性层，配合指定的激活函数，active_fun在开头配置
@@ -243,9 +270,22 @@ class MLP_post(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(MLP_post, self).__init__()
         self.linear1 = nn.Linear(input_dim, output_dim, bias)    
+        self.linear2 = nn.Linear(output_dim, output_dim, False)    
+        self.sigmoid = nn.Sigmoid()
+        self.relu = nn.ReLU()
+        self.tanh = nn.Tanh()
+        self.dropout = nn.Dropout(0.5)
     def forward(self, x):
+        # x  = self.relu(x)
         x = self.linear1(x)
+        x = self.tanh(x)
+        # x = self.dropout(x)
+        # x  = self.relu(x)
+        # x = self.linear2(x)
+        # x = GLUA.forward(x)
         return x
+    
+
 class MLP_One_Layer(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(MLP_One_Layer, self).__init__()
@@ -262,6 +302,18 @@ class MLP_One_Layer(nn.Module):
         # x = self.bn(x)
         # x = x.view(shape)
         return x
+# 自定义可学习的掩码层（仅允许取值为0或1）
+class BinaryMaskLayer(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(BinaryMaskLayer, self).__init__()
+        self.mask = nn.Parameter(torch.randn(test_K),True)
+
+    def forward(self, x):
+        binary_mask = torch.clamp(torch.sign(self.mask), min=0)   # 使用torch.clamp和torch.sign进行二值化处理
+        # binary_mask_expanded = binary_mask.unsqueeze(0).unsqueeze(-1)
+        masked_output = x * binary_mask   # 将输入张量与二进制掩码相乘得到输出结果
+        return masked_output
+MyBinaryMaskLayer = BinaryMaskLayer(dimension,dimension)
 
 # 本网络中的mlp涉及到多个，每一个mlp应该为不同的实例，这样才能保证参数分别进行更新
 mlp_pre_ap = MLP_One_Layer(1,1 * dimension) 
@@ -356,87 +408,7 @@ class UEConv(nn.Module):
 
         g.send_and_recv(g.edges(etype=('AP2UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP2UE'))
 
-# class EgdeConv(nn.Module):
-#     def __init__(self, mlp1, mlp2, mlp3,  **kwargs):
-#         super(EgdeConv, self).__init__()
-#         self.mlp1 = mlp1
-#         self.mlp2 = mlp2
-#         self.mlp3 = mlp3
-#     def forward(self, g):
-#         edge_num = g.number_of_edges()
-#         # g.edges['AP2UE'].data['new'] = torch.zeros_like(g.edges['AP2UE'].data['hid'])
-#         for i in range(0,edge_num):
-#             # 得到当前边的源节点 和 目标节点
-#             src,dst = g.find_edges(i)
-#             # 1、将源节点的特征和相关边进行拼接放入mlp1
-#             # 得到源节点的特征
-#             src_node_feature = torch.squeeze(g.ndata['hid']['AP'][src])
-#             # 源节点的所有出边(单向边，有入边吗？)
-#             out_edges = g.out_edges(src)
-#             # 对于AP的结果矩阵，-1是因为要去掉自己这条边
-#             mlp_result_AP = torch.zeros(len(out_edges[0]) - 1,dimension)
-#             # 遍历这些出边
-#             idx = 0
-#             for j in range(0,len(out_edges[0])):
-#                 # 拿到边的下标
-#                 out_edge_indices = g.edge_ids(out_edges[0][j],out_edges[1][j])
-#                 # 去掉自己
-#                 if(out_edge_indices == i):
-#                     continue
-#                 # 拿到边的特征
-#                 neighbor_edge_features = torch.squeeze(g.edges['AP2UE'].data['hid'][out_edge_indices])
-#                 # 聚合，节点特征和临边特征进入mlp通通进入
-#                 mlp_result_AP[idx,:] = self.mlp1(
-#                     torch.cat((src_node_feature,neighbor_edge_features),dim = -1))
-#                 idx += 1
-#             # 2、将目标节点的特征和相关边进行拼接放入mlp2
-#             # 得到目标节点的特征
-#             dst_node_feature = torch.squeeze(g.ndata['hid']['UE'][dst])
-#             # 目标节点的所有入边
-#             in_edges = g.in_edges(dst)
-#             # 对于UE的结果矩阵，-1是因为要去掉自己这条边
-#             mlp_result_UE = torch.zeros(len(in_edges[0]) - 1,dimension)
-#             # 遍历这些出边
-#             idx = 0
-#             for j in range(0,len(in_edges[0])):
-#                 # 拿到边
-#                 in_edges = g.in_edges(dst)
-#                 # 拿到边的下标
-#                 in_edge_indices = g.edge_ids(in_edges[0][j],in_edges[1][j])
-#                 # 去掉自己
-#                 if(in_edge_indices == i):
-#                     continue
-#                 # 拿到边的特征
-#                 neighbor_edge_features = torch.squeeze(g.edges['AP2UE'].data['hid'][in_edge_indices])
-#                 # 聚合，节点特征和临边特征进入mlp通通进入
-#                 mlp_result_UE[idx,:] = self.mlp2(
-#                     torch.cat((src_node_feature,neighbor_edge_features),dim = -1))
-#                 idx += 1
-#             # max 聚合
-#             agg, _ = torch.max(torch.cat((mlp_result_AP,mlp_result_UE),dim=0),dim = 0)
-#             agg = torch.squeeze(agg)
-#             g.edges['AP2UE'].data['new'][i] = self.mlp3(torch.cat((agg, g.edges['AP2UE'].data['hid'][i]),dim = -1)).clone()
-#         # g.edata['feat'] = g.edata['feat'].clone()
-#         g.edges['AP2UE'].data['hid'] = g.edges['AP2UE'].data['new']
-        
-        
-# class EgdeConv(nn.Module):
-#     def __init__(self, mlp1, mlp2, mlp3,  **kwargs):
-#         super(EgdeConv, self).__init__()
-#         self.mlp1 = mlp1
-#         self.mlp2 = mlp2
-#         self.mlp3 = mlp3
-#     def massge_func(self, edges):
-#         mlp_result = self.mlp1(torch.cat((edges.src['hid'],edges.dst['hid']),dim = -1))
-#         new_edge_feat = self.mlp2(torch.cat((mlp_result, edges.data['hid']),dim=-1))
-#         return {'new':new_edge_feat}
-#     def forward(self, g):
-#         g.apply_edges(self.massge_func,etype =('UE2AP'))
-#         g.apply_edges(self.massge_func,etype =('AP','AP2UE','UE'))
-#         g.edges['UE2AP'].data['hid'] = g.edges['UE2AP'].data['new']
-#         g.edges['AP2UE'].data['hid'] = g.edges['AP2UE'].data['new']
-#         g.nodes['UE'].data['hid'] = g.nodes['UE'].data['new']
-#         g.nodes['AP'].data['hid'] = g.nodes['AP'].data['new']
+
 
 # 流程：对于一条边来说：
 # 1、所连AP与AP的所有边（去除自己）拼接进入mlp
@@ -521,6 +493,7 @@ def norm_func(real, imag):
     beamformer_complex = torch.complex(real, imag)
     dims = beamformer_complex.size()
     for i in range(0,dims[0]):
+        # if(torch.norm(beamformer_complex[i,:,:].clone(), dim=1,p=2)!=0):
         beamformer_complex[i,:,:] = beamformer_complex[i,:,:].clone() / torch.unsqueeze(torch.norm(beamformer_complex[i,:,:].clone(), dim=1,p=2),dim=-1)
     real_normalized = torch.real(beamformer_complex)
     imag_normalized = torch.imag(beamformer_complex)
@@ -540,7 +513,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,weight_decay=1
 # optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate)
 # optimizer = torch.optim.RMSprop(model.parameters(), lr=0.00001)
 
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.98,)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.2)
 
 
 
