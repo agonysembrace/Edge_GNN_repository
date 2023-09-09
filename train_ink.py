@@ -52,7 +52,7 @@ c = 1/np.sqrt(2)
 # PowerBudget /W
 P_max = 1
 # backhaulBudget /bps
-C_max = 1.1
+# C_max = 1.1
 # sigma
 sigma = var_noise
 # AP数量，单天线 train和test显然是可以不一样的
@@ -62,29 +62,42 @@ test_B = 16
 train_K = 8
 test_K = 8
 # 训练集
-train_layouts = 200
+train_layouts = 100
 # 测试集
-test_layouts = 200
+test_layouts = 100
 # 模拟路损
 beta = 0.6
 
 hid_dim = 64
 # 指示函数因子
 delta = 1e-5
+data_from_mat = scipy.io.loadmat('lable.mat')
+Hd = np.transpose(data_from_mat['Hd1'],(0,2,1))
+train_channel_rel = np.real(Hd[0:train_layouts,:,:])
+train_channel_ima = np.imag(Hd[0:train_layouts,:,:])
+train_C_max = data_from_mat['C_max'][0:train_layouts]
+train_lable = data_from_mat['binarys'][0:train_layouts]
 
+test_channel_rel = np.real(Hd[train_layouts:train_layouts+test_layouts,:,:])
+test_channel_ima = np.imag(Hd[train_layouts:train_layouts+test_layouts,:,:])
+test_C_max = data_from_mat['C_max'][train_layouts:train_layouts+test_layouts]
+test_lable = data_from_mat['binarys'][train_layouts:train_layouts+test_layouts]
 # 创建信道，因为不能直接输入复数进入神经网络，我们输入信道的模值
 # 创建信道实部
-train_channel_rel = beta * np.random.randn(train_layouts, train_B, train_K)
-# 创建信道虚部
-train_channel_ima = beta * np.random.randn(train_layouts, train_B, train_K)
-# print(train_channel_rel + 1j * train_channel_ima)
-# test
-test_channel_rel = beta * np.random.randn(test_layouts, test_B, test_K)
-test_channel_ima = beta * np.random.randn(test_layouts, test_B, test_K)
-scipy.io.savemat('test_channel.mat',{'test_channel':test_channel_rel + 1j* test_channel_ima})
-train_channel = scipy.io.loadmat('test_200_channel.mat')
-test_channel_rel = np.transpose(np.real(train_channel['Hd1']),axes=(0, 2, 1))
-test_channel_ima = np.transpose(np.imag(train_channel['Hd1']),axes=(0, 2, 1))
+# train_channel_rel = beta * np.random.randn(train_layouts, train_B, train_K)
+# # 创建信道虚部
+# train_channel_ima = beta * np.random.randn(train_layouts, train_B, train_K)
+# train_lable =  np.random.rand(train_layouts,train_B,train_K).round()
+# train_C_max = 10+np.random.randn(train_layouts, train_B)
+# test_channel_rel = beta * np.random.randn(test_layouts, test_B, test_K)
+# test_channel_ima = beta * np.random.randn(test_layouts, test_B, test_K)
+# test_lable =  np.random.rand(test_layouts,test_B, test_K).round()
+# test_C_max =  10+np.random.randn(test_layouts, test_B)
+
+# # scipy.io.savemat('test_channel.mat',{'test_channel':test_channel_rel + 1j* test_channel_ima})
+# train_channel = scipy.io.loadmat('test_200_channel.mat')
+# test_channel_rel = np.transpose(np.real(train_channel['Hd1']),axes=(0, 2, 1))
+# test_channel_ima = np.transpose(np.imag(train_channel['Hd1']),axes=(0, 2, 1))
 
 def normalize_one_tensor(tensor):
     min_val = torch.min(tensor)
@@ -93,9 +106,11 @@ def normalize_one_tensor(tensor):
     return normalized_tensor
 # 构建数据集，数据构成为：信道实虚部，APUE数量
 class MyDataset(DGLDataset):
-    def __init__(self, rel, ima, BK):
+    def __init__(self, rel, ima, lable, C_max, BK):
         self.rel = rel
         self.ima = ima
+        self.lable = lable
+        self.C_max = C_max
         # sinr 分子（信道增益
         # self.direct = torch.tensor(direct, dtype = torch.float)
         self.BK = BK
@@ -112,7 +127,9 @@ class MyDataset(DGLDataset):
                                   ('UE','UE2AP','AP'): self.adj_t}) 
         
         ## AP数据为功率budget
-        graph.nodes['AP'].data['feat'] = torch.unsqueeze(1 * torch.ones(self.BK[0]),dim=-1) 
+        graph.nodes['AP'].data['feat'] = torch.unsqueeze(normalize_one_tensor(torch.tensor(self.C_max[idx,:], dtype = torch.float)),dim=-1)
+        ## AP数据为功率budget
+        graph.nodes['AP'].data['feat'] = torch.unsqueeze((torch.tensor(self.C_max[idx,:], dtype = torch.float)),dim=-1)
         ## UE数据为sigma^2
         graph.nodes['UE'].data['feat'] = torch.unsqueeze(1 * torch.ones(self.BK[1]),dim=-1) 
         # bool_tensor=torch.ones((8,2),dtype=bool)
@@ -141,7 +158,7 @@ class MyDataset(DGLDataset):
     # 获取一条数据
     def __getitem__(self, index):
        # 返回指定索引的图、信道实虚部
-        return self.graph_list[index], self.rel[index], self.ima[index]
+        return self.graph_list[index], self.lable[index]
     # 创建一个大的图list的函数
     def process(self):
         n = len(self.rel)
@@ -153,57 +170,29 @@ class MyDataset(DGLDataset):
 
 # DGL collate function 用于批处理时，构成一个小批次     
 def collate(samples):
-    graphs, rel, ima  = map(list, zip(*samples))
+    graphs, label  = map(list, zip(*samples))
     batched_graph = dgl.batch(graphs) 
-    return batched_graph, torch.stack([torch.from_numpy(i) for i in rel]) , torch.stack([torch.from_numpy(i) for i in ima]) 
-
+    return batched_graph, torch.stack([torch.from_numpy(i) for i in label]) 
 
 # 以上构建完图结构后，下面开始构建图神经网络，这里我们把神经网络的输出看做两个向量拼接成的矩阵，所以维度(:,:,0)表示实部 (:,:,1)表示虚部
 # 根据神经网络的输出（beamformer）和我们固定的信道信息 计算合速率
-def rate_loss(beamformer, rel, ima, test_mode = False):
+def rate_loss(link, label, test_mode = False):
 
-    beamformer_all = beamformer[:, :, :, 0].float() + 1j * beamformer[:, :, :, 1].float() 
-    channel_all = rel.float() + 1j * ima.float() 
-    B_cur = beamformer.size()[1]
-    K_cur = beamformer.size()[2]
-    batch_cur = rel.shape[0]
-    SINRs_numerators = torch.zeros((batch_cur, K_cur)) 
-    SINRs_denominators = torch.zeros(batch_cur, K_cur) 
-    # 分子，表示有用信号
-    for i in range(0, K_cur):
-            SINRs_numerators[:,i] = torch.squeeze(torch.abs(torch.matmul(beamformer_all[:,:,i].unsqueeze(1), torch.transpose(channel_all[:,:,i].unsqueeze(1),dim0=1,dim1=2))) ** 2)
-    # 分母是干扰波束*自己的信道
-    for i in range(0, K_cur):
-            for j in range(0, K_cur):
-                if(i != j):
-                    # bb = beamformer_all[b,:,j].unsqueeze(0)
-                    # bbb = torch.transpose(channel_all[b,:,i].unsqueeze(0),0,1)
-                    SINRs_denominators[:,i] = SINRs_denominators[:,i] + torch.squeeze(torch.abs(torch.matmul(beamformer_all[:,:,j].unsqueeze(1) , torch.transpose(channel_all[:,:,i].unsqueeze(1),dim0=1,dim1=2))) ** 2)
-    SINRs_denominators += var_noise
-    SINRs = SINRs_numerators / SINRs_denominators 
-    rates = torch.log2(1 + SINRs) 
-    sum_rate = torch.sum(rates, dim = 1)  # take sum
-    # sum_rate = torch.min(rates, dim = 1)[0]  # take sum
-    # 计算每个AP的backhaul放入目标函数
-    backhaul = torch.zeros(batch_cur,B_cur)
-    for i in range(0, B_cur):
-        for k in range(0,K_cur):
-            # backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))*rates[:,k]
-            backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))
-    # sum_rate = 0*sum_rate
-    # sum_rate -= 10000*torch.norm(beamformer_all,dim = (1,2))
-    # sum_rate -= 1000*torch.sum(torch.abs(torch.log(torch.norm(beamformer_all,dim = (2))/delta+1)/torch.log(torch.tensor(1/delta+1))-C_max),dim=1)
-    # sum_rate -= 1000*torch.abs(torch.sum((torch.norm(beamformer_all,dim = (2))/(delta+torch.norm(beamformer_all,dim = (2)))),dim=1)-C_max)
-    # sum_rate -= torch.sum( 10* (backhaul),dim = 1)
-    # sum_rate -= torch.sum( 10* torch.abs(backhaul-C_max),dim = 1)
-    # sum_rate -= torch.sum( 10* (backhaul-C_max),dim = 1)
+    threshold = 0.5 # 设置阈值
+
+    binary_output = torch.zeros_like(link) # 创建与模型输出相同大小的全零矩阵
+
+    # 使用条件判断将大于等于阈值的元素赋予1，小于阈值的元素赋予0
+    binary_output[link >= threshold] = 1
+    binary_output = binary_output.squeeze()
+    # criterion = nn.CrossEntropyLoss()
+    criterion = nn.BCEWithLogitsLoss()
+    loss = criterion(link.squeeze(),label.to(torch.float32))
     if test_mode:
-        return sum_rate
+        return loss
     else:
-        return -torch.mean(sum_rate)
-def caculate_backhaul(beamformer):
-    backhaul = torch.log(torch.norm(torch.tensor(beamformer),dim = 1)/delta+1)/torch.log(torch.tensor(1/delta+1))
-    return backhaul
+        return torch.mean(loss)
+
 # 定义整体的神经网络结构，输入层MLP（将数据转换成APnode、UEnode、edge，维度全是64）->多个中间更新层MLP（保持维度为64）->输出层MLP
 class HetGNN(nn.Module):
     def __init__(self):
@@ -223,23 +212,7 @@ class HetGNN(nn.Module):
                             graph.number_of_nodes('AP')//graph.batch_size,
                             graph.number_of_nodes('UE')//graph.batch_size,
                             -1)
-        output_real = output[:,:,:,0]
-        output_imag = output[:,:,:,1]
-        # P_max = 1
-        norm_output_real, norm_output_imag = output_real, output_imag
-        bool_tensor=torch.ones((4,2))
-        bool_tensor = bool_tensor.unsqueeze(0).expand(output_real.size()[0],-1,-1)
-        bool_tensor[:,1,0] = 0
-        output_real = output_real*bool_tensor
-        output_imag = output_imag*bool_tensor
-        # bool_tensor[1,0] = False
-        norm_output_real, norm_output_imag = norm_func(output_real, output_imag)
-        # norm_output_real = MyBinaryMaskLayer.forward(norm_output_real)
-        # norm_output_imag = MyBinaryMaskLayer.forward(norm_output_imag)
-        norm_output = torch.cat((torch.unsqueeze(norm_output_real,dim = 3),
-                                 torch.unsqueeze(norm_output_imag,dim = 3)),dim = 3)
-        # norm_output = MyBinaryMaskLayer.forward(norm_output)
-        return norm_output
+        return output
     
 # 本网络中的所有MLP保持为3个线性层，配合指定的激活函数，active_fun在开头配置
 class MLP(nn.Module):
@@ -290,7 +263,8 @@ class MLP_post(nn.Module):
     def forward(self, x):
         # x  = self.relu(x)
         x = self.linear1(x)
-        x = self.tanh(x)
+        x = self.sigmoid(x)
+        # x = self.tanh(x)
         # x = self.dropout(x)
         # x  = self.relu(x)
         # x = self.linear2(x)
@@ -346,7 +320,7 @@ mlp_update_6 = MLP(dimension*2,dimension)
 # mlp for EDGE
 mlp_update_7 = MLP(dimension*2,dimension) 
 
-mlp_post = MLP_post(dimension,2) 
+mlp_post = MLP_post(dimension,1) 
  
 # 预处理层，将初始的节点特征和边特征，进行维度映射
 class PreLayer(nn.Module):
@@ -533,19 +507,19 @@ scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.98
 def test(loader):
     model.eval()
     correct = 0
-    for (g, rel, ima) in loader:
+    for (g, lable) in loader:
         optimizer.zero_grad()
 
-        K = rel.shape[-1] # 6
-        bs = len(g.nodes['UE'].data['feat'])//K
+        K = lable.shape[1] # 6
+        bs = len(g.nodes['AP'].data['feat'])//K
         output = model(g)
-        loss = rate_loss(output, rel, ima)
+        loss = rate_loss(output, lable)
         correct += loss.item() * bs
     return correct / len(loader.dataset)
 def main():
     # 创建数据集，实际上是把训练数据和测试数据构建成图的过程
-    train_data = MyDataset(train_channel_rel, train_channel_ima, (train_B, train_K))
-    test_data = MyDataset(test_channel_rel, test_channel_ima,  (test_B, test_K))
+    train_data = MyDataset(train_channel_rel, train_channel_ima, train_lable,train_C_max,(train_B, train_K))
+    test_data = MyDataset(test_channel_rel, test_channel_ima,test_lable, test_C_max ,(test_B, test_K))
 
     # train_data = train_data 
     # 检查一下异构图的两类结点名称
@@ -560,14 +534,13 @@ def main():
         """ Train for one epoch. """
         model.train()
         loss_all = 0
-        for batch_idx, (g, rel, ima) in enumerate(train_loader):
-            K = rel.shape[-1] # 6
-            bs = len(g.nodes['UE'].data['feat'])//K
+        for batch_idx, (g, lable) in enumerate(train_loader):
+            K = lable.shape[1] # 6
+            bs = len(g.nodes['AP'].data['feat'])//K
             output = model(g)
-            loss = rate_loss(output, rel, ima)
-            # loss.requires_grad_(True)
+            loss = rate_loss(output, lable)
+            loss.requires_grad_(True)
             optimizer.zero_grad()
-
             loss.backward()
         
             loss_all += loss.item() * bs
@@ -587,17 +560,17 @@ def main():
     # beamformer= torch.zeros()
     ## For CDF Plot
     import matplotlib.pyplot as plt
-    for  (g, rel, ima) in test_loader:
+    for  (g, lable) in test_loader:
         index = 0
-        K = rel.shape[-1] # 6
-        bs = len(g.nodes['UE'].data['feat'])//K
+        K = lable.shape[-1] # 6
+        bs = len(g.nodes['AP'].data['feat'])//K
       
         output = model(g)
         # print(output)
         # scipy.io.savemat('beamformer.mat',{'beamformer':record.detach().cpu().numpy()})
-        gnn_rates = rate_loss(output, rel, ima, True).flatten().detach().cpu().numpy()
+        gnn_rates = rate_loss(output, lable, True).flatten().detach().cpu().numpy()
         full = 0.5*torch.ones_like(output)
-        all_one_rates= rate_loss(full, rel, ima, True).flatten().cpu().numpy()
+        all_one_rates= rate_loss(full,lable, True).flatten().cpu().numpy()
 
     # beamformer = beamformer.cpu()
 
