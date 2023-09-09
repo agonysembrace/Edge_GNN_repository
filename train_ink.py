@@ -129,7 +129,7 @@ class MyDataset(DGLDataset):
         ## AP数据为功率budget
         graph.nodes['AP'].data['feat'] = torch.unsqueeze(normalize_one_tensor(torch.tensor(self.C_max[idx,:], dtype = torch.float)),dim=-1)
         ## AP数据为功率budget
-        graph.nodes['AP'].data['feat'] = torch.unsqueeze((torch.tensor(self.C_max[idx,:], dtype = torch.float)),dim=-1)
+        # graph.nodes['AP'].data['feat'] = torch.unsqueeze((torch.tensor(self.C_max[idx,:], dtype = torch.float)),dim=-1)
         ## UE数据为sigma^2
         graph.nodes['UE'].data['feat'] = torch.unsqueeze(1 * torch.ones(self.BK[1]),dim=-1) 
         # bool_tensor=torch.ones((8,2),dtype=bool)
@@ -185,6 +185,9 @@ def rate_loss(link, label, test_mode = False):
     # 使用条件判断将大于等于阈值的元素赋予1，小于阈值的元素赋予0
     binary_output[link >= threshold] = 1
     binary_output = binary_output.squeeze()
+
+    a = (binary_output==label)
+    false_count = (~a).sum().item()
     # criterion = nn.CrossEntropyLoss()
     criterion = nn.BCEWithLogitsLoss()
     loss = criterion(link.squeeze(),label.to(torch.float32))
