@@ -187,7 +187,8 @@ def rate_loss(link, label, test_mode = False):
     binary_output = binary_output.squeeze()
 
     a = (binary_output==label)
-    false_count = (~a).sum().item()
+    false_count = (a).sum().item()
+    print(false_count/(1600*8))
     # criterion = nn.CrossEntropyLoss()
     criterion = nn.BCEWithLogitsLoss()
     loss = criterion(link.squeeze(),label.to(torch.float32))

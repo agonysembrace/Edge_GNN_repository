@@ -52,15 +52,15 @@ c = 1/np.sqrt(2)
 # PowerBudget /W
 P_max = 1
 # backhaulBudget /bps
-C_max = 1.1
+C_max = 2
 # sigma
 sigma = var_noise
 # AP数量，单天线 train和test显然是可以不一样的
-train_B = 16
-test_B = 16
+train_B = 4
+test_B = 4
 # UE数量
-train_K = 8
-test_K = 8
+train_K = 4
+test_K = 4
 # 训练集
 train_layouts = 200
 # 测试集
@@ -70,7 +70,7 @@ beta = 0.6
 
 hid_dim = 64
 # 指示函数因子
-delta = 1e-5
+delta = 1e-3
 
 # 创建信道，因为不能直接输入复数进入神经网络，我们输入信道的模值
 # 创建信道实部
@@ -81,11 +81,12 @@ train_channel_ima = beta * np.random.randn(train_layouts, train_B, train_K)
 # test
 test_channel_rel = beta * np.random.randn(test_layouts, test_B, test_K)
 test_channel_ima = beta * np.random.randn(test_layouts, test_B, test_K)
-scipy.io.savemat('test_channel.mat',{'test_channel':test_channel_rel + 1j* test_channel_ima})
-train_channel = scipy.io.loadmat('test_200_channel.mat')
-test_channel_rel = np.transpose(np.real(train_channel['Hd1']),axes=(0, 2, 1))
-test_channel_ima = np.transpose(np.imag(train_channel['Hd1']),axes=(0, 2, 1))
-
+# scipy.io.savemat('test_channel.mat',{'test_channel':test_channel_rel + 1j* test_channel_ima})
+# train_channel = scipy.io.loadmat('test_200_channel.mat')
+# # test_channel_rel = np.transpose(np.real(train_channel['Hd1']),axes=(0, 2, 1))
+# # test_channel_ima = np.transpose(np.imag(train_channel['Hd1']),axes=(0, 2, 1))
+# train_channel_rel = np.transpose(np.real(train_channel['Hd1']),axes=(0, 2, 1))
+# train_channel_ima = np.transpose(np.imag(train_channel['Hd1']),axes=(0, 2, 1))
 def normalize_one_tensor(tensor):
     min_val = torch.min(tensor)
     max_val = torch.max(tensor)
@@ -157,10 +158,11 @@ def collate(samples):
     batched_graph = dgl.batch(graphs) 
     return batched_graph, torch.stack([torch.from_numpy(i) for i in rel]) , torch.stack([torch.from_numpy(i) for i in ima]) 
 
-
+# relu = nn.Softplus()
+relu = nn.ReLU()
 # 以上构建完图结构后，下面开始构建图神经网络，这里我们把神经网络的输出看做两个向量拼接成的矩阵，所以维度(:,:,0)表示实部 (:,:,1)表示虚部
 # 根据神经网络的输出（beamformer）和我们固定的信道信息 计算合速率
-def rate_loss(beamformer, rel, ima, test_mode = False):
+def rate_loss(lambda1, beamformer, rel, ima, test_mode = False):
 
     beamformer_all = beamformer[:, :, :, 0].float() + 1j * beamformer[:, :, :, 1].float() 
     channel_all = rel.float() + 1j * ima.float() 
@@ -188,21 +190,25 @@ def rate_loss(beamformer, rel, ima, test_mode = False):
     backhaul = torch.zeros(batch_cur,B_cur)
     for i in range(0, B_cur):
         for k in range(0,K_cur):
-            # backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))*rates[:,k]
-            backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))
+            backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))*rates[:,k]
+            # backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))
     # sum_rate = 0*sum_rate
     # sum_rate -= 10000*torch.norm(beamformer_all,dim = (1,2))
     # sum_rate -= 1000*torch.sum(torch.abs(torch.log(torch.norm(beamformer_all,dim = (2))/delta+1)/torch.log(torch.tensor(1/delta+1))-C_max),dim=1)
-    # sum_rate -= 1000*torch.abs(torch.sum((torch.norm(beamformer_all,dim = (2))/(delta+torch.norm(beamformer_all,dim = (2)))),dim=1)-C_max)
+    # sum_rate -= 1000*(torch.sum(torch.abs((torch.norm(beamformer_all,dim = (2))/(delta+torch.norm(beamformer_all,dim = (2))))-C_max),dim=1))
     # sum_rate -= torch.sum( 10* (backhaul),dim = 1)
-    # sum_rate -= torch.sum( 10* torch.abs(backhaul-C_max),dim = 1)
-    # sum_rate -= torch.sum( 10* (backhaul-C_max),dim = 1)
+    sum_rate = sum_rate - torch.sum( 1* torch.abs(backhaul-C_max),dim = 1)
+    
+    # sum_rate -= torch.sum( lambda1* torch.abs(backhaul-C_max),dim = 1) +torch.sum( 1000*relu((backhaul-C_max)),dim=1)
+    # sum_rate -= torch.sum( 1000*relu((backhaul-C_max)),dim=1)+torch.sum(1000*relu(torch.norm(beamformer_all[:,:,:], dim=1,p=2)-P_max),dim=1)
+    # sum_rate -= torch.sum( 1000*relu((backhaul-C_max)),dim=1)
+    # sum_rate -= torch.sum(1000*torch.abs(torch.norm(beamformer_all[:,:,:], dim=2,p=2)-P_max),dim=1)
     if test_mode:
         return sum_rate
     else:
         return -torch.mean(sum_rate)
 def caculate_backhaul(beamformer):
-    backhaul = torch.log(torch.norm(torch.tensor(beamformer),dim = 1)/delta+1)/torch.log(torch.tensor(1/delta+1))
+    backhaul = torch.log(torch.norm((beamformer),dim = 1)/delta+1)/torch.log(torch.tensor(1/delta+1))
     return backhaul
 # 定义整体的神经网络结构，输入层MLP（将数据转换成APnode、UEnode、edge，维度全是64）->多个中间更新层MLP（保持维度为64）->输出层MLP
 class HetGNN(nn.Module):
@@ -210,36 +216,38 @@ class HetGNN(nn.Module):
         super(HetGNN, self).__init__()
         
         self.preLayer = PreLayer() # 预处理层
-        self.update_layers = nn.ModuleList([UpdateLayer()] * 2)  # 更新层，这里使用了2个更新层
-        self.postprocess_layer = PostLayer(mlp_post) # 后处理层
+        self.update_layers = nn.ModuleList([UpdateLayer()] * 3)  # 更新层，这里使用了2个更新层
+        self.postprocess_layer = PostLayer(mlp_post, mlp_post_lambda) # 后处理层
     
     # 输入网络时，节点特征数量为batchsize*AP batchsize*UE，边特征数量为
     def forward(self, graph):
         self.preLayer(graph)
         for update_layer in self.update_layers:
             update_layer(graph)
-        output = self.postprocess_layer(graph)
+        lambda1,output = self.postprocess_layer(graph)
         output = output.view(graph.batch_size,
                             graph.number_of_nodes('AP')//graph.batch_size,
                             graph.number_of_nodes('UE')//graph.batch_size,
                             -1)
+        lambda1 = lambda1.view(graph.batch_size,graph.number_of_nodes('AP')//graph.batch_size)
         output_real = output[:,:,:,0]
         output_imag = output[:,:,:,1]
         # P_max = 1
         norm_output_real, norm_output_imag = output_real, output_imag
-        bool_tensor=torch.ones((4,2))
-        bool_tensor = bool_tensor.unsqueeze(0).expand(output_real.size()[0],-1,-1)
-        bool_tensor[:,1,0] = 0
-        output_real = output_real*bool_tensor
-        output_imag = output_imag*bool_tensor
+        # bool_tensor=torch.ones((4,2))
+        # bool_tensor = bool_tensor.unsqueeze(0).expand(output_real.size()[0],-1,-1)
+        # bool_tensor[:,1,0] = 0
+        # output_real = output_real*bool_tensor
+        # output_imag = output_imag*bool_tensor
         # bool_tensor[1,0] = False
+        # 归一化 功率约束
         norm_output_real, norm_output_imag = norm_func(output_real, output_imag)
         # norm_output_real = MyBinaryMaskLayer.forward(norm_output_real)
         # norm_output_imag = MyBinaryMaskLayer.forward(norm_output_imag)
         norm_output = torch.cat((torch.unsqueeze(norm_output_real,dim = 3),
                                  torch.unsqueeze(norm_output_imag,dim = 3)),dim = 3)
         # norm_output = MyBinaryMaskLayer.forward(norm_output)
-        return norm_output
+        return lambda1, norm_output
     
 # 本网络中的所有MLP保持为3个线性层，配合指定的激活函数，active_fun在开头配置
 class MLP(nn.Module):
@@ -290,7 +298,7 @@ class MLP_post(nn.Module):
     def forward(self, x):
         # x  = self.relu(x)
         x = self.linear1(x)
-        x = self.tanh(x)
+        # x = self.tanh(x)
         # x = self.dropout(x)
         # x  = self.relu(x)
         # x = self.linear2(x)
@@ -347,7 +355,7 @@ mlp_update_6 = MLP(dimension*2,dimension)
 mlp_update_7 = MLP(dimension*2,dimension) 
 
 mlp_post = MLP_post(dimension,2) 
- 
+mlp_post_lambda = MLP_post(dimension,1) 
 # 预处理层，将初始的节点特征和边特征，进行维度映射
 class PreLayer(nn.Module):
     def __init__(self):
@@ -362,11 +370,13 @@ class PreLayer(nn.Module):
         graph.edges['UE2AP'].data['hid'] = self.EDGE_pre_MLP(graph.edges['UE2AP'].data['feat'])
 
 class PostLayer(nn.Module):
-    def __init__(self, mlp):
+    def __init__(self, mlp, mlp_lambda):
         super(PostLayer, self).__init__()
         self.post_mlp = mlp
+        self.post_mlp_lambda = mlp_lambda
     def forward(self, graph):
-        return self.post_mlp(graph.edata['hid'][('AP','AP2UE','UE')])
+        # a = graph.ndata['hid']['UE']
+        return self.post_mlp_lambda(graph.ndata['hid']['AP']), self.post_mlp(graph.edata['hid'][('AP','AP2UE','UE')])
 
 class APConv(nn.Module):
     def __init__(self, mlp1, mlp2, **kwargs):
@@ -504,9 +514,11 @@ def norm_func(real, imag):
     imag_normalized = imag
     beamformer_complex = torch.complex(real, imag)
     dims = beamformer_complex.size()
-    for i in range(0,dims[0]):
+    beamformer_complex[:,:,:] = beamformer_complex[:,:,:].clone() / (torch.unsqueeze(torch.norm(beamformer_complex[:,:,:].clone(), dim=2,p=2),dim=-1)+0.0001)
+
+    # for i in range(0,dims[0]):
         # if(torch.norm(beamformer_complex[i,:,:].clone(), dim=1,p=2)!=0):
-        beamformer_complex[i,:,:] = beamformer_complex[i,:,:].clone() / torch.unsqueeze(torch.norm(beamformer_complex[i,:,:].clone(), dim=1,p=2),dim=-1)
+        # beamformer_complex[i,:,:] = beamformer_complex[i,:,:].clone() / (torch.unsqueeze(torch.norm(beamformer_complex[i,:,:].clone(), dim=1,p=2),dim=-1)+0.0001)
     real_normalized = torch.real(beamformer_complex)
     imag_normalized = torch.imag(beamformer_complex)
     return real_normalized, imag_normalized
@@ -525,7 +537,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,weight_decay=1
 # optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate)
 # optimizer = torch.optim.RMSprop(model.parameters(), lr=0.00001)
 
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.98)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.9)
 
 
 
@@ -538,8 +550,8 @@ def test(loader):
 
         K = rel.shape[-1] # 6
         bs = len(g.nodes['UE'].data['feat'])//K
-        output = model(g)
-        loss = rate_loss(output, rel, ima)
+        lambda1, output = model(g)
+        loss = rate_loss(lambda1, output, rel, ima)
         correct += loss.item() * bs
     return correct / len(loader.dataset)
 def main():
@@ -563,8 +575,8 @@ def main():
         for batch_idx, (g, rel, ima) in enumerate(train_loader):
             K = rel.shape[-1] # 6
             bs = len(g.nodes['UE'].data['feat'])//K
-            output = model(g)
-            loss = rate_loss(output, rel, ima)
+            lambda1,output = model(g)
+            loss = rate_loss(lambda1,output, rel, ima)
             # loss.requires_grad_(True)
             optimizer.zero_grad()
 
