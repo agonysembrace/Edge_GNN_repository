@@ -56,8 +56,8 @@ C_max = 2
 # sigma
 sigma = var_noise
 # AP数量，单天线 train和test显然是可以不一样的
-train_B = 4
-test_B = 4
+train_B = 8
+test_B = 8
 # UE数量
 train_K = 4
 test_K = 4
@@ -162,9 +162,11 @@ def collate(samples):
 relu = nn.ReLU()
 # 以上构建完图结构后，下面开始构建图神经网络，这里我们把神经网络的输出看做两个向量拼接成的矩阵，所以维度(:,:,0)表示实部 (:,:,1)表示虚部
 # 根据神经网络的输出（beamformer）和我们固定的信道信息 计算合速率
-def rate_loss(lambda1, beamformer, rel, ima, test_mode = False):
+def rate_loss(x, beamformer, rel, ima, test_mode = False):
 
     beamformer_all = beamformer[:, :, :, 0].float() + 1j * beamformer[:, :, :, 1].float() 
+    beamformer_all = x.squeeze() * beamformer_all
+    beamformer_all = norm_func_2(beamformer_all)
     channel_all = rel.float() + 1j * ima.float() 
     B_cur = beamformer.size()[1]
     K_cur = beamformer.size()[2]
@@ -188,17 +190,24 @@ def rate_loss(lambda1, beamformer, rel, ima, test_mode = False):
     # sum_rate = torch.min(rates, dim = 1)[0]  # take sum
     # 计算每个AP的backhaul放入目标函数
     backhaul = torch.zeros(batch_cur,B_cur)
+    backhaul_x = torch.zeros(batch_cur,B_cur)
     for i in range(0, B_cur):
         for k in range(0,K_cur):
             backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))*rates[:,k]
+    for i in range(0, B_cur):
+        for k in range(0,K_cur):
+            # backhaul_x[:,i] = backhaul_x[:,i]+torch.sum(x[:,i,k]*rates[:,k],dim = -1)        
+            backhaul_x[:,i] = backhaul_x[:,i]+x[:,i,k].squeeze()  
             # backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))
     # sum_rate = 0*sum_rate
     # sum_rate -= 10000*torch.norm(beamformer_all,dim = (1,2))
     # sum_rate -= 1000*torch.sum(torch.abs(torch.log(torch.norm(beamformer_all,dim = (2))/delta+1)/torch.log(torch.tensor(1/delta+1))-C_max),dim=1)
     # sum_rate -= 1000*(torch.sum(torch.abs((torch.norm(beamformer_all,dim = (2))/(delta+torch.norm(beamformer_all,dim = (2))))-C_max),dim=1))
     # sum_rate -= torch.sum( 10* (backhaul),dim = 1)
-    sum_rate = sum_rate - torch.sum( 1* torch.abs(backhaul-C_max),dim = 1)
-    
+    # sum_rate = sum_rate - torch.sum( 1* torch.abs(backhaul-C_max),dim = 1)
+    # sum_rate = sum_rate - torch.sum(x*(1-x)) - torch.sum( 1* torch.abs(backhaul_x-C_max),dim = 1)
+
+    sum_rate = sum_rate - torch.sum(x*(1-x)) - torch.sum( 100* torch.abs(backhaul_x-2),dim = 1)
     # sum_rate -= torch.sum( lambda1* torch.abs(backhaul-C_max),dim = 1) +torch.sum( 1000*relu((backhaul-C_max)),dim=1)
     # sum_rate -= torch.sum( 1000*relu((backhaul-C_max)),dim=1)+torch.sum(1000*relu(torch.norm(beamformer_all[:,:,:], dim=1,p=2)-P_max),dim=1)
     # sum_rate -= torch.sum( 1000*relu((backhaul-C_max)),dim=1)
@@ -217,19 +226,22 @@ class HetGNN(nn.Module):
         
         self.preLayer = PreLayer() # 预处理层
         self.update_layers = nn.ModuleList([UpdateLayer()] * 3)  # 更新层，这里使用了2个更新层
-        self.postprocess_layer = PostLayer(mlp_post, mlp_post_lambda) # 后处理层
+        self.postprocess_layer = PostLayer(mlp_post, mlp_post_lambda, mlp_post_x) # 后处理层
     
     # 输入网络时，节点特征数量为batchsize*AP batchsize*UE，边特征数量为
     def forward(self, graph):
         self.preLayer(graph)
         for update_layer in self.update_layers:
             update_layer(graph)
-        lambda1,output = self.postprocess_layer(graph)
+        x,output = self.postprocess_layer(graph)
         output = output.view(graph.batch_size,
                             graph.number_of_nodes('AP')//graph.batch_size,
                             graph.number_of_nodes('UE')//graph.batch_size,
                             -1)
-        lambda1 = lambda1.view(graph.batch_size,graph.number_of_nodes('AP')//graph.batch_size)
+        x = x.view(graph.batch_size,
+                            graph.number_of_nodes('AP')//graph.batch_size,
+                            graph.number_of_nodes('UE')//graph.batch_size,
+                            -1)
         output_real = output[:,:,:,0]
         output_imag = output[:,:,:,1]
         # P_max = 1
@@ -247,7 +259,7 @@ class HetGNN(nn.Module):
         norm_output = torch.cat((torch.unsqueeze(norm_output_real,dim = 3),
                                  torch.unsqueeze(norm_output_imag,dim = 3)),dim = 3)
         # norm_output = MyBinaryMaskLayer.forward(norm_output)
-        return lambda1, norm_output
+        return x, norm_output
     
 # 本网络中的所有MLP保持为3个线性层，配合指定的激活函数，active_fun在开头配置
 class MLP(nn.Module):
@@ -304,7 +316,19 @@ class MLP_post(nn.Module):
         # x = self.linear2(x)
         # x = GLUA.forward(x)
         return x
-    
+class MLP_post_x(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(MLP_post_x, self).__init__()
+        self.linear1 = nn.Linear(input_dim, output_dim, bias)    
+        self.sigmoid = nn.Sigmoid()
+        self.relu = nn.ReLU()
+        self.tanh = nn.Tanh()
+        self.dropout = nn.Dropout(0.5)
+    def forward(self, x):
+        # x  = self.relu(x)
+        x = self.linear1(x)
+        x = self.sigmoid(x)
+        return x    
 
 class MLP_One_Layer(nn.Module):
     def __init__(self, input_dim, output_dim):
@@ -356,6 +380,7 @@ mlp_update_7 = MLP(dimension*2,dimension)
 
 mlp_post = MLP_post(dimension,2) 
 mlp_post_lambda = MLP_post(dimension,1) 
+mlp_post_x = MLP_post_x(dimension,1)
 # 预处理层，将初始的节点特征和边特征，进行维度映射
 class PreLayer(nn.Module):
     def __init__(self):
@@ -370,13 +395,14 @@ class PreLayer(nn.Module):
         graph.edges['UE2AP'].data['hid'] = self.EDGE_pre_MLP(graph.edges['UE2AP'].data['feat'])
 
 class PostLayer(nn.Module):
-    def __init__(self, mlp, mlp_lambda):
+    def __init__(self, mlp, mlp_lambda, mlp_post_x):
         super(PostLayer, self).__init__()
         self.post_mlp = mlp
         self.post_mlp_lambda = mlp_lambda
+        self.post_mlp_x =  mlp_post_x
     def forward(self, graph):
         # a = graph.ndata['hid']['UE']
-        return self.post_mlp_lambda(graph.ndata['hid']['AP']), self.post_mlp(graph.edata['hid'][('AP','AP2UE','UE')])
+        return self.post_mlp_x(graph.edata['hid'][('AP','AP2UE','UE')]), self.post_mlp(graph.edata['hid'][('AP','AP2UE','UE')])
 
 class APConv(nn.Module):
     def __init__(self, mlp1, mlp2, **kwargs):
@@ -514,7 +540,7 @@ def norm_func(real, imag):
     imag_normalized = imag
     beamformer_complex = torch.complex(real, imag)
     dims = beamformer_complex.size()
-    beamformer_complex[:,:,:] = beamformer_complex[:,:,:].clone() / (torch.unsqueeze(torch.norm(beamformer_complex[:,:,:].clone(), dim=2,p=2),dim=-1)+0.0001)
+    beamformer_complex[:,:,:] = beamformer_complex[:,:,:].clone() / (torch.unsqueeze(torch.norm(beamformer_complex[:,:,:].clone(), dim=2,p=2),dim=-1)+1e-10)
 
     # for i in range(0,dims[0]):
         # if(torch.norm(beamformer_complex[i,:,:].clone(), dim=1,p=2)!=0):
@@ -523,9 +549,9 @@ def norm_func(real, imag):
     imag_normalized = torch.imag(beamformer_complex)
     return real_normalized, imag_normalized
 # 定义输入维度、隐藏层维度和输出维度
-
-
-
+def norm_func_2(beamformer_complex):
+    beamformer_complex[:,:,:] = beamformer_complex[:,:,:].clone() / (torch.unsqueeze(torch.norm(beamformer_complex[:,:,:].clone(), dim=2,p=2),dim=-1)+1e-10)
+    return beamformer_complex
 
 # 创建HetGNN模型实例
 hetgnn_model = HetGNN()
@@ -550,8 +576,8 @@ def test(loader):
 
         K = rel.shape[-1] # 6
         bs = len(g.nodes['UE'].data['feat'])//K
-        lambda1, output = model(g)
-        loss = rate_loss(lambda1, output, rel, ima)
+        x, output = model(g)
+        loss = rate_loss(x, output, rel, ima)
         correct += loss.item() * bs
     return correct / len(loader.dataset)
 def main():
@@ -575,8 +601,8 @@ def main():
         for batch_idx, (g, rel, ima) in enumerate(train_loader):
             K = rel.shape[-1] # 6
             bs = len(g.nodes['UE'].data['feat'])//K
-            lambda1,output = model(g)
-            loss = rate_loss(lambda1,output, rel, ima)
+            x,output = model(g)
+            loss = rate_loss(x,output, rel, ima)
             # loss.requires_grad_(True)
             optimizer.zero_grad()
 
