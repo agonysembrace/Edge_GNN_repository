@@ -36,11 +36,12 @@ device = torch.device('cpu')
 bias = True
 dimension = 64
 # 指定训练轮数
-epoch_num = 5000
+epoch_num = 2000
 # 指定批大小
 batch_size = 200
 # 指定学习率
 learning_rate = 1e-3
+lambda_lr = 1
 # 指定高斯白噪声
 var_noise = 1
 # 指定激活函数
@@ -52,19 +53,19 @@ c = 1/np.sqrt(2)
 # PowerBudget /W
 P_max = 1
 # backhaulBudget /bps
-C_max = 2
+C_max = 3
 # sigma
 sigma = var_noise
 # AP数量，单天线 train和test显然是可以不一样的
-train_B = 8
-test_B = 8
+train_B = 4
+test_B = 4
 # UE数量
 train_K = 4
 test_K = 4
-# 训练集
-train_layouts = 200
+# 训练2
+train_layouts = batch_size * 1
 # 测试集
-test_layouts = 200
+test_layouts = 5
 # 模拟路损
 beta = 0.6
 
@@ -81,12 +82,14 @@ train_channel_ima = beta * np.random.randn(train_layouts, train_B, train_K)
 # test
 test_channel_rel = beta * np.random.randn(test_layouts, test_B, test_K)
 test_channel_ima = beta * np.random.randn(test_layouts, test_B, test_K)
+# lambda_init = torch.zeros(train_layouts, train_B)
+
 # scipy.io.savemat('test_channel.mat',{'test_channel':test_channel_rel + 1j* test_channel_ima})
-# train_channel = scipy.io.loadmat('test_200_channel.mat')
-# # test_channel_rel = np.transpose(np.real(train_channel['Hd1']),axes=(0, 2, 1))
-# # test_channel_ima = np.transpose(np.imag(train_channel['Hd1']),axes=(0, 2, 1))
-# train_channel_rel = np.transpose(np.real(train_channel['Hd1']),axes=(0, 2, 1))
-# train_channel_ima = np.transpose(np.imag(train_channel['Hd1']),axes=(0, 2, 1))
+# train_channel = scipy.io.loadmat('16-8-backhaul2.mat')
+# # # test_channel_rel = np.transpose(np.real(train_channel['Hd1']),axes=(0, 2, 1))
+# # # test_channel_ima = np.transpose(np.imag(train_channel['Hd1']),axes=(0, 2, 1))
+# train_channel_rel = np.transpose(np.real(train_channel['Hd']),axes=(0, 2, 1))
+# train_channel_ima = np.transpose(np.imag(train_channel['Hd']),axes=(0, 2, 1))
 def normalize_one_tensor(tensor):
     min_val = torch.min(tensor)
     max_val = torch.max(tensor)
@@ -101,6 +104,7 @@ class MyDataset(DGLDataset):
         # self.direct = torch.tensor(direct, dtype = torch.float)
         self.BK = BK
         self.get_cg()
+        self.lambda_init = torch.zeros(rel.shape[0],BK[0])
         super().__init__(name='beamformer_design')
 
     def build_graph(self, idx):
@@ -114,6 +118,8 @@ class MyDataset(DGLDataset):
         
         ## AP数据为功率budget
         graph.nodes['AP'].data['feat'] = torch.unsqueeze(1 * torch.ones(self.BK[0]),dim=-1) 
+        ## AP数据还有backhaul budget
+        graph.nodes['AP'].data['bakchaul'] = torch.unsqueeze(C_max * torch.ones(self.BK[0]),dim=-1) 
         ## UE数据为sigma^2
         graph.nodes['UE'].data['feat'] = torch.unsqueeze(1 * torch.ones(self.BK[1]),dim=-1) 
         # bool_tensor=torch.ones((8,2),dtype=bool)
@@ -142,7 +148,7 @@ class MyDataset(DGLDataset):
     # 获取一条数据
     def __getitem__(self, index):
        # 返回指定索引的图、信道实虚部
-        return self.graph_list[index], self.rel[index], self.ima[index]
+        return self.graph_list[index], self.rel[index], self.ima[index] , self.lambda_init[index]
     # 创建一个大的图list的函数
     def process(self):
         n = len(self.rel)
@@ -154,19 +160,28 @@ class MyDataset(DGLDataset):
 
 # DGL collate function 用于批处理时，构成一个小批次     
 def collate(samples):
-    graphs, rel, ima  = map(list, zip(*samples))
+    graphs, rel, ima, lambda_init  = map(list, zip(*samples))
     batched_graph = dgl.batch(graphs) 
-    return batched_graph, torch.stack([torch.from_numpy(i) for i in rel]) , torch.stack([torch.from_numpy(i) for i in ima]) 
+    return batched_graph, torch.stack([torch.from_numpy(i) for i in rel]) , torch.stack([torch.from_numpy(i) for i in ima]),torch.stack(lambda_init)
 
 # relu = nn.Softplus()
 relu = nn.ReLU()
 # 以上构建完图结构后，下面开始构建图神经网络，这里我们把神经网络的输出看做两个向量拼接成的矩阵，所以维度(:,:,0)表示实部 (:,:,1)表示虚部
 # 根据神经网络的输出（beamformer）和我们固定的信道信息 计算合速率
-def rate_loss(x, beamformer, rel, ima, test_mode = False):
-
+def rate_loss(lambda_gnn, x, beamformer, rel, ima, test_mode = False):
+    
+    x = torch.squeeze(x)
+    # x = (x > 0.5).float()
     beamformer_all = beamformer[:, :, :, 0].float() + 1j * beamformer[:, :, :, 1].float() 
-    beamformer_all = x.squeeze() * beamformer_all
+    # 引入新的association变量
+    # beamformer_all = x.squeeze() * beamformer_all
+    # 测试第一个基站不为第一个用户服务
+    # beamformer_all[:,0,0] = 0
     beamformer_all = norm_func_2(beamformer_all)
+    norm_beam = torch.norm(beamformer_all.unsqueeze(-1),dim = -1)
+    mask = (norm_beam > 0.01).float()
+    # beamformer_all = mask * beamformer_all
+    
     channel_all = rel.float() + 1j * ima.float() 
     B_cur = beamformer.size()[1]
     K_cur = beamformer.size()[2]
@@ -190,15 +205,20 @@ def rate_loss(x, beamformer, rel, ima, test_mode = False):
     # sum_rate = torch.min(rates, dim = 1)[0]  # take sum
     # 计算每个AP的backhaul放入目标函数
     backhaul = torch.zeros(batch_cur,B_cur)
-    backhaul_x = torch.zeros(batch_cur,B_cur)
+    # backhaul_x = torch.zeros(batch_cur,B_cur)
     for i in range(0, B_cur):
         for k in range(0,K_cur):
-            backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))*rates[:,k]
-    for i in range(0, B_cur):
-        for k in range(0,K_cur):
-            # backhaul_x[:,i] = backhaul_x[:,i]+torch.sum(x[:,i,k]*rates[:,k],dim = -1)        
-            backhaul_x[:,i] = backhaul_x[:,i]+x[:,i,k].squeeze()  
-            # backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))
+            # backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))*rates[:,k]
+            backhaul[:,i] = backhaul[:,i]+rates[:,k]
+            # backhaul[:,i] = backhaul[:,i]+x[:,i,k].squeeze()  *rates[:,k]
+    # for i in range(0, B_cur):
+    #     for k in range(0,K_cur):
+    #         # 关注速率和
+    #         # backhaul_x[:,i] = backhaul_x[:,i]+torch.sum(x[:,i,k]*rates[:,k],dim = -1)     
+    #         # 只关注连接数   
+    #         backhaul_x[:,i] = backhaul_x[:,i]+x[:,i,k].squeeze()  
+    backhaul_x = torch.sum(x,dim=-1)
+    #         backhaul[:,i] = backhaul[:,i]+caculate_backhaul(beamformer_all[:,i,k].unsqueeze(1))
     # sum_rate = 0*sum_rate
     # sum_rate -= 10000*torch.norm(beamformer_all,dim = (1,2))
     # sum_rate -= 1000*torch.sum(torch.abs(torch.log(torch.norm(beamformer_all,dim = (2))/delta+1)/torch.log(torch.tensor(1/delta+1))-C_max),dim=1)
@@ -206,38 +226,110 @@ def rate_loss(x, beamformer, rel, ima, test_mode = False):
     # sum_rate -= torch.sum( 10* (backhaul),dim = 1)
     # sum_rate = sum_rate - torch.sum( 1* torch.abs(backhaul-C_max),dim = 1)
     # sum_rate = sum_rate - torch.sum(x*(1-x)) - torch.sum( 1* torch.abs(backhaul_x-C_max),dim = 1)
-
-    sum_rate = sum_rate - torch.sum(x*(1-x)) - torch.sum( 100* torch.abs(backhaul_x-2),dim = 1)
+    C = C_max*torch.ones_like(backhaul)
+    # C = 16*torch.ones_like(backhaul)
+    zero = torch.zeros_like(backhaul)
+    rates_min = 0.2*torch.ones_like(rates)
+    zero_rates = torch.zeros_like(rates)
+    
+    power_cur = torch.norm(beamformer_all[:,:,:].clone(), dim=2,p=2)
+    bs_backhaul = caculate_backhaul_threshold(beamformer_all)
+    # sum_rate = sum_rate - torch.sum(x*(1-x)) - torch.sum( 100* torch.abs(backhaul_x-2),dim = 1)
     # sum_rate -= torch.sum( lambda1* torch.abs(backhaul-C_max),dim = 1) +torch.sum( 1000*relu((backhaul-C_max)),dim=1)
     # sum_rate -= torch.sum( 1000*relu((backhaul-C_max)),dim=1)+torch.sum(1000*relu(torch.norm(beamformer_all[:,:,:], dim=1,p=2)-P_max),dim=1)
-    # sum_rate -= torch.sum( 1000*relu((backhaul-C_max)),dim=1)
+    # sum_rate = sum_rate - torch.sum(x*(1-x)) - torch.sum( torch.maximum(backhaul_x-C,zero)) -torch.sum(torch.maximum(rates_min-rates,zero_rates))
+    # sum_rate -= torch.sum( 1000*torch.maximum(backhaul-C,zero),dim=1)
     # sum_rate -= torch.sum(1000*torch.abs(torch.norm(beamformer_all[:,:,:], dim=2,p=2)-P_max),dim=1)
+    # sum_rate -= 100*torch.sum(bs_backhaul, dim = 1)
+    # backhaul_constraint =torch.sum( torch.maximum(backhaul_x-C,zero)) 
+    # backhaul_constraint =torch.sum( torch.abs(backhaul-20))
+    # backhaul_constraint =torch.sum( 1* custom_maxmum_function(backhaul-20,zero))
+    # backhaul_constraint = torch.mean( custom_maxmum_function(backhaul_x-C,zero))
+    backhaul_nograd = backhaul.data
+    backhaul_constraint2 = torch.sum(lambda_gnn * (backhaul_nograd - C),dim = 1)
+    backhaul_constraint =  (backhaul - C)
+    # backhaul_constraint = (power_cur - P_max)
+    # sum_rate -= backhaul_constraint
     if test_mode:
         return sum_rate
+        
     else:
-        return -torch.mean(sum_rate)
+        # return -torch.mean(sum_rate),backhaul_constraint,torch.sum(x*(1-x))
+        return -torch.mean(sum_rate), backhaul_constraint, -100*torch.mean(backhaul_constraint2)
+class CustomMaximum(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, y):
+        maximum_values = torch.maximum(x, y)
+        ctx.save_for_backward(maximum_values, x, y)  # 保存前向传播中需要用到的变量
+        return maximum_values
+    
+    @staticmethod
+    def backward(ctx, grad_output): 
+        maximum_values, x ,y = ctx.saved_tensors
+        
+        # gradient_x = (x >= y).float() * grad_output   # 较大值对应的梯度为grad_output，较小值对应的梯度为0
+        # gradient_y = (y > x).float() * grad_output     # 较大值对应的梯度为grad_output，较小值对应的梯度为0
+        
+         # 如果想让较小元素具有固定大小（例如0.1） 的非零梯度，则将上述语句修改如下：
+        gradient_x = ((x >= y).float() - (x < y).float()) * grad_output  
+        gradient_y = ((y > x).float() - (y <= x).float()) * grad_output  
+        return gradient_x, gradient_y
+custom_maxmum_function = CustomMaximum.apply
+class Htanh(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, epsilon=1):
+        ctx.save_for_backward(x.data, torch.tensor(epsilon))
+        return (x.sign()+1)/2
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, epsilon = ctx.saved_tensors
+        dx = torch.where((x < - epsilon) | (x > epsilon), torch.zeros_like(dy), dy)
+        dx = torch.rand_like(x)
+        dx = (dx * 2) - 1
+        return dx, None
+htanh = Htanh()
+x = torch.tensor([-2.5, -1.6, 0, 3.6, 4.7])
+y = htanh.apply(x)
+print(y)
 def caculate_backhaul(beamformer):
     backhaul = torch.log(torch.norm((beamformer),dim = 1)/delta+1)/torch.log(torch.tensor(1/delta+1))
     return backhaul
+def caculate_backhaul_threshold(beamformer):
+    beamformer_norm = torch.norm(beamformer.unsqueeze(-1),dim=-1)
+    after_threshold = (beamformer_norm > 0.01).float()
+    bs_backhaul = torch.sum(after_threshold,dim=(2))
+    return bs_backhaul
+
 # 定义整体的神经网络结构，输入层MLP（将数据转换成APnode、UEnode、edge，维度全是64）->多个中间更新层MLP（保持维度为64）->输出层MLP
 class HetGNN(nn.Module):
     def __init__(self):
         super(HetGNN, self).__init__()
         
         self.preLayer = PreLayer() # 预处理层
-        self.update_layers = nn.ModuleList([UpdateLayer()] * 3)  # 更新层，这里使用了2个更新层
+        self.update_layers = nn.ModuleList([UpdateLayer()] * 2)  # 更新层，这里使用了2个更新层
         self.postprocess_layer = PostLayer(mlp_post, mlp_post_lambda, mlp_post_x) # 后处理层
     
+
+
+        self.preLayer_x = PreLayer_x() # 预处理层
+        self.update_layers_x = nn.ModuleList([UpdateLayer_x()] * 2)  # 更新层，这里使用了2个更新层
+        self.postprocess_layer_x = PostLayer_x() # 后处理层
     # 输入网络时，节点特征数量为batchsize*AP batchsize*UE，边特征数量为
     def forward(self, graph):
         self.preLayer(graph)
         for update_layer in self.update_layers:
             update_layer(graph)
-        x,output = self.postprocess_layer(graph)
+        lambda_gnn,output = self.postprocess_layer(graph)
+        lambda_gnn = lambda_gnn.view(graph.batch_size,-1)
         output = output.view(graph.batch_size,
                             graph.number_of_nodes('AP')//graph.batch_size,
                             graph.number_of_nodes('UE')//graph.batch_size,
                             -1)
+        self.preLayer_x(graph)
+        for update_layer_x in self.update_layers_x:
+            update_layer_x(graph)
+        x = self.postprocess_layer_x(graph)
         x = x.view(graph.batch_size,
                             graph.number_of_nodes('AP')//graph.batch_size,
                             graph.number_of_nodes('UE')//graph.batch_size,
@@ -253,13 +345,13 @@ class HetGNN(nn.Module):
         # output_imag = output_imag*bool_tensor
         # bool_tensor[1,0] = False
         # 归一化 功率约束
-        norm_output_real, norm_output_imag = norm_func(output_real, output_imag)
+        # norm_output_real, norm_output_imag = norm_func(output_real, output_imag)
         # norm_output_real = MyBinaryMaskLayer.forward(norm_output_real)
         # norm_output_imag = MyBinaryMaskLayer.forward(norm_output_imag)
         norm_output = torch.cat((torch.unsqueeze(norm_output_real,dim = 3),
                                  torch.unsqueeze(norm_output_imag,dim = 3)),dim = 3)
         # norm_output = MyBinaryMaskLayer.forward(norm_output)
-        return x, norm_output
+        return lambda_gnn, x, norm_output
     
 # 本网络中的所有MLP保持为3个线性层，配合指定的激活函数，active_fun在开头配置
 class MLP(nn.Module):
@@ -316,6 +408,15 @@ class MLP_post(nn.Module):
         # x = self.linear2(x)
         # x = GLUA.forward(x)
         return x
+class MLP_post_lambda(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(MLP_post_lambda, self).__init__()
+        self.linear1 = nn.Linear(input_dim, output_dim, bias)    
+        self.relu = nn.ReLU()
+    def forward(self, x):
+        x = self.linear1(x)
+        x  = self.relu(x)
+        return x
 class MLP_post_x(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(MLP_post_x, self).__init__()
@@ -327,9 +428,13 @@ class MLP_post_x(nn.Module):
     def forward(self, x):
         # x  = self.relu(x)
         x = self.linear1(x)
+        # x = self.tanh(x)
         x = self.sigmoid(x)
+        # x = htanh.apply(x)
+        x = threshold_fun(x)
         return x    
-
+def threshold_fun(x):
+    return 1./(1+torch.exp(-50*(x-0.5)))
 class MLP_One_Layer(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(MLP_One_Layer, self).__init__()
@@ -379,7 +484,7 @@ mlp_update_6 = MLP(dimension*2,dimension)
 mlp_update_7 = MLP(dimension*2,dimension) 
 
 mlp_post = MLP_post(dimension,2) 
-mlp_post_lambda = MLP_post(dimension,1) 
+mlp_post_lambda = MLP_post_lambda(dimension,1) 
 mlp_post_x = MLP_post_x(dimension,1)
 # 预处理层，将初始的节点特征和边特征，进行维度映射
 class PreLayer(nn.Module):
@@ -394,6 +499,23 @@ class PreLayer(nn.Module):
         graph.edges['AP2UE'].data['hid'] = self.EDGE_pre_MLP(graph.edges['AP2UE'].data['feat'])
         graph.edges['UE2AP'].data['hid'] = self.EDGE_pre_MLP(graph.edges['UE2AP'].data['feat'])
 
+class PreLayer_x(nn.Module):
+    def __init__(self):
+        super(PreLayer_x, self).__init__()
+        self.AP_pre_MLP = MLP_One_Layer(1,1 * dimension) 
+        self.UE_pre_MLP = MLP_One_Layer(1,1 * dimension) 
+        self.EDGE_pre_MLP = MLP_One_Layer(2,dimension) 
+    def forward(self, graph):
+        graph.nodes['AP'].data['x'] = self.AP_pre_MLP(graph.nodes['AP'].data['feat'])
+        graph.nodes['UE'].data['x'] = self.UE_pre_MLP(graph.nodes['UE'].data['feat'])
+        graph.edges['AP2UE'].data['x'] = self.EDGE_pre_MLP(graph.edges['AP2UE'].data['feat'])
+        graph.edges['UE2AP'].data['x'] = self.EDGE_pre_MLP(graph.edges['UE2AP'].data['feat'])
+class PostLayer_x(nn.Module):
+    def __init__(self):
+        super(PostLayer_x, self).__init__()
+        self.post_mlp_x =  MLP_post_x(dimension,1)
+    def forward(self, graph):
+        return self.post_mlp_x(graph.edata['x'][('AP','AP2UE','UE')])
 class PostLayer(nn.Module):
     def __init__(self, mlp, mlp_lambda, mlp_post_x):
         super(PostLayer, self).__init__()
@@ -402,7 +524,7 @@ class PostLayer(nn.Module):
         self.post_mlp_x =  mlp_post_x
     def forward(self, graph):
         # a = graph.ndata['hid']['UE']
-        return self.post_mlp_x(graph.edata['hid'][('AP','AP2UE','UE')]), self.post_mlp(graph.edata['hid'][('AP','AP2UE','UE')])
+        return self.post_mlp_lambda(graph.ndata['hid'][('AP')]), self.post_mlp(graph.edata['hid'][('AP','AP2UE','UE')])
 
 class APConv(nn.Module):
     def __init__(self, mlp1, mlp2, **kwargs):
@@ -430,7 +552,57 @@ class APConv(nn.Module):
         # g.send_and_recv(g.edges(etype=('AP','AP2UE','UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP','AP2UE','UE'))
         g.send_and_recv(g.edges(etype=('UE2AP')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('UE','UE2AP','AP'))
 
-            
+class APConv_x(nn.Module):
+    def __init__(self, mlp1, mlp2, **kwargs):
+        super(APConv_x, self).__init__()
+        self.mlp1 = mlp1
+        self.mlp2 = mlp2
+
+    def forward(self, g):
+        # 对每个AP节点，获取其临边
+        def message_func(edges):
+            neighbor_ue_features = edges.src['x']
+            edge_feature = edges.data['x']
+            return {'neighbor_ue_features': neighbor_ue_features,
+                    'edge_feature': edge_feature}
+
+        def reduce_func(nodes):
+            AP_mlp_result = self.mlp1(torch.cat((nodes.mailbox['edge_feature'],
+                                                    nodes.mailbox['neighbor_ue_features']), dim=-1))
+            # 聚合邻居ue数据，取Max
+            # agg, _ = torch.max(AP_mlp_result, dim=1)
+            agg = torch.sum(AP_mlp_result, dim=1)
+
+            new_AP_feat = self.mlp2(torch.cat((nodes.data['x'], agg), dim=-1))
+            new_AP_feat = agg
+            return {'new_x': new_AP_feat}
+        # g.send_and_recv(g.edges(etype=('AP','AP2UE','UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP','AP2UE','UE'))
+        g.send_and_recv(g.edges(etype=('UE2AP')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('UE','UE2AP','AP'))    
+class UEConv_x(nn.Module):
+    def __init__(self, mlp1, mlp2, **kwargs):
+        super(UEConv_x, self).__init__()
+        self.mlp1 = mlp1
+        self.mlp2 = mlp2
+
+    def forward(self, g):
+        # 对每个UE节点，获取其临边
+        def message_func(edges):
+            neighbor_ap_features = edges.src['x']
+            edge_feature = edges.data['x']
+            return {'neighbor_ap_features': neighbor_ap_features,
+                    'edge_feature': edge_feature}
+
+        def reduce_func(nodes):
+            UE_mlp_result = self.mlp1(torch.cat((nodes.mailbox['edge_feature'],
+                                                  nodes.mailbox['neighbor_ap_features']), dim=-1))
+            # agg, _ = torch.max(UE_mlp_result, dim=1)
+            agg = torch.sum(UE_mlp_result, dim=1)
+
+            new_UE_feat = self.mlp2(torch.cat((nodes.data['x'], agg), dim=-1))
+            new_UE_feat = agg
+            return {'new_x': new_UE_feat}
+
+        g.send_and_recv(g.edges(etype=('AP2UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP2UE'))     
 class UEConv(nn.Module):
     def __init__(self, mlp1, mlp2, **kwargs):
         super(UEConv, self).__init__()
@@ -457,7 +629,24 @@ class UEConv(nn.Module):
         g.send_and_recv(g.edges(etype=('AP2UE')), message_func=message_func,reduce_func = reduce_func,apply_node_func = None,etype= ('AP2UE'))
 
 
+class EgdeConv_x(nn.Module):
+    def __init__(self, mlp1, mlp2, mlp3,  **kwargs):
+        super(EgdeConv_x, self).__init__()
+        self.mlp1 = mlp1
+        self.mlp2 = mlp2
+        self.mlp3 = mlp3
 
+    def forward(self, g):
+        def message_func_edge(edges):
+            # 获取掩码，消息的边来源不能等于当前边
+            ap_info = edges.src['ap_result']
+            ue_info = edges.dst['ue_result']
+            # agg = torch.max(torch.cat((ap_info,ue_info),dim = 1),dim = 1)[0]
+            agg = torch.sum(torch.cat((ap_info,ue_info),dim = 1),dim = 1)
+            return {'new_x': self.mlp3(torch.cat((edges.data['x'],agg),dim = -1))}
+        g.apply_edges(message_func_edge,etype =('AP','AP2UE','UE'))
+        g.edges['UE2AP'].data['new_x'] = g.edges['AP2UE'].data['new_x']
+        # 对每个AP节点，获取其
 # 流程：对于一条边来说：
 # 1、所连AP与AP的所有边（去除自己）拼接进入mlp
 # 2、所连UE与UE的所有边（去除自己) 拼接进入mlp
@@ -518,7 +707,18 @@ class EgdeConv(nn.Module):
         g.edges['UE2AP'].data['hid'] = g.edges['UE2AP'].data['new']
         g.edges['AP2UE'].data['hid'] = g.edges['AP2UE'].data['new']
 
-
+class UpdateLayer_x(nn.Module):
+    def __init__(self):
+        super(UpdateLayer_x, self).__init__()
+        self.APConv = APConv_x( MLP(dimension*2,dimension) ,  MLP(dimension*2,dimension) )
+        self.UEConv = UEConv_x( MLP(dimension*2,dimension) ,  MLP(dimension*2,dimension) )
+        self.EgdeConv = EgdeConv_x( MLP(dimension*2,dimension) , MLP(dimension*2,dimension) , MLP(dimension*2,dimension) )
+    
+    def forward(self, graph):
+        self.APConv(graph)
+        self.UEConv(graph)
+        self.EgdeConv(graph)
+        
 
 # 更新层，对于节点和边的更新有着不同的策略,这与messagePassingGNN产生了明显的不同
 class UpdateLayer(nn.Module):
@@ -560,10 +760,12 @@ hetgnn_model = HetGNN()
 model = hetgnn_model
 
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,weight_decay=1e-3)
+
+# optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate,weight_decay=1e-3)
 # optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate)
 # optimizer = torch.optim.RMSprop(model.parameters(), lr=0.00001)
 
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.9)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
 
 
 
@@ -571,15 +773,17 @@ scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.9)
 def test(loader):
     model.eval()
     correct = 0
-    for (g, rel, ima) in loader:
+    for (g, rel, ima, lambda_init) in loader:
         optimizer.zero_grad()
 
         K = rel.shape[-1] # 6
         bs = len(g.nodes['UE'].data['feat'])//K
-        x, output = model(g)
-        loss = rate_loss(x, output, rel, ima)
+        lambda_gnn, x, output = model(g)
+        loss,loss2,loss3 = rate_loss(lambda_gnn, x, output, rel, ima)
         correct += loss.item() * bs
     return correct / len(loader.dataset)
+# global lambda_init2
+lambda_init2 = torch.zeros(train_layouts,train_B, requires_grad=True, device=device)
 def main():
     # 创建数据集，实际上是把训练数据和测试数据构建成图的过程
     train_data = MyDataset(train_channel_rel, train_channel_ima, (train_B, train_K))
@@ -594,23 +798,10 @@ def main():
     train_loader = DataLoader(train_data, batch_size, shuffle=True, collate_fn=collate)
     # train_loader = DataLoader(train_data, batch_size, shuffle=True, collate_fn=collate,num_workers=4,pin_memory=True)、
     test_loader = DataLoader(test_data, test_layouts, shuffle=True, collate_fn=collate)
-    def train(epoch):
-        """ Train for one epoch. """
-        model.train()
-        loss_all = 0
-        for batch_idx, (g, rel, ima) in enumerate(train_loader):
-            K = rel.shape[-1] # 6
-            bs = len(g.nodes['UE'].data['feat'])//K
-            x,output = model(g)
-            loss = rate_loss(x,output, rel, ima)
-            # loss.requires_grad_(True)
-            optimizer.zero_grad()
-
-            loss.backward()
-        
-            loss_all += loss.item() * bs
-            optimizer.step()
-        return loss_all / len(train_loader.dataset)
+    # def train(epoch):
+    #     """ Train for one epoch. """
+       
+    #     return loss_all2 / len(train_loader.dataset)
     
     for epoch in range(0, epoch_num):
         if(epoch % 10 == 1):
@@ -618,8 +809,84 @@ def main():
                 # train_rate = train(train_loader)
                 test_rate = test(test_loader)
             print('Epoch {:03d},  ——————————  Test Rate: {:.4f}'.format(epoch,test_rate))
-        train_rate = train(epoch)
-        print('Epoch {:03d}, Train Rate: {:.4f}'.format(epoch, train_rate))
+
+        global lambda_init2
+        global lambda_lr
+        model.train()
+        loss_all = 0
+        loss_all2 = 0
+        for batch_idx, (g, rel, ima, lambda_init) in enumerate(train_loader):
+            model.zero_grad()
+
+            # 清零上一个batch的梯度
+            K = rel.shape[-1] # 6
+            bs = len(g.nodes['UE'].data['feat'])//K
+            lambda_gnn,x,output = model(g)
+            
+
+            loss,constraint,loss3 = rate_loss(lambda_gnn, x,output, rel, ima)
+            # loss.requires_grad_(True)
+            # loss.requires_grad_(True)
+            # loss2.requires_grad_(True)
+           
+            # optimizer.zero_grad()
+            # loss.backward(retain_graph=True)
+            # loss3.backward()
+            # print(loss3)
+            # model.zero_grad()
+            # lambda_init = 1
+            lambda_now = lambda_init2[batch_idx*batch_size:(batch_idx+1)*batch_size,:]
+            # lambda_init2.retain_grad()
+
+            # mask = constraint < 0
+            # grad_direct = torch.ones_like(lambda_now)
+            # grad_direct[mask] = -1
+            # loss.backward(retain_graph=True)
+            # loss2.backward(retain_graph=True)
+            # loss3.backward()
+            constraint_gap = torch.mean(torch.sum((lambda_now * constraint),dim=1))
+            gap = torch.sum(torch.abs(constraint))
+            # print(constraint_gap)
+            Utility_func = loss + 1*constraint_gap
+            # lambda_cur.requires_grad=False
+            Utility_func.backward()
+            
+            # 不允许负值
+            # perform gradient ascent/descent
+            with torch.no_grad():
+                mask = constraint < 0
+                lambda_init2[mask] = 0
+                # lambda_now =  lambda_now  + grad_direct * 1 * 0.01     
+                # lambda_init2[batch_idx*batch_size:(batch_idx+1)*batch_size,:] = lambda_now
+            # primal GNN parameters
+                for i, theta_main in enumerate(list(model.parameters())):
+                    # theta_main += lr_main * torch.clamp(dtheta_main[i], min=-1, max=1)
+                    if theta_main.grad is not None:
+                        # print('main', i)
+                        theta_main -= learning_rate * theta_main.grad
+                #如果梯度符号和自己的值的符号是一致的，那么就不继续增加lambda了
+                # mask_lambda = (lambda_init2 > 0) * (lambda_init2.grad > 0) + (lambda_init2 < 0) * (lambda_init2.grad < 0)
+                # mask_value = torch.ones_like(lambda_init2)
+                # lambda_init2.grad[mask_lambda] = 0
+                # if (epoch + 1) % 10 == 0:
+                #     lambda_init2 += lambda_lr * lambda_init2.grad
+                lambda_init2 += lambda_lr * lambda_init2.grad
+            lambda_init2.data.clamp_(0)  
+            # 清空梯度
+            for theta_ in list(model.parameters()) + [lambda_init2]:
+                if theta_.grad is not None:
+                    theta_.grad.zero_()
+            loss_all += loss.item() * bs
+            loss_all2 += Utility_func.item() * bs
+            
+            # lambda_init2.requires_grad = False
+            # optimizer.step()    
+        # train_rate = train(epoch)
+        if (epoch + 1) % 50 == 0:
+            lambda_lr *= 0.95
+        # loss_all += loss.item() * bs
+        train_rate = loss_all / len(train_loader.dataset)
+        print('Epoch {:03d}, Train Rate: {:.4f}, Constraint Gap: {:.4f}'.format(epoch, train_rate,constraint_gap))
         scheduler.step()
 
     # beamformer= torch.zeros()
@@ -630,12 +897,12 @@ def main():
         K = rel.shape[-1] # 6
         bs = len(g.nodes['UE'].data['feat'])//K
       
-        output = model(g)
+        x,output = model(g)
         # print(output)
         # scipy.io.savemat('beamformer.mat',{'beamformer':record.detach().cpu().numpy()})
-        gnn_rates = rate_loss(output, rel, ima, True).flatten().detach().cpu().numpy()
+        gnn_rates= rate_loss(x,output, rel, ima, True).flatten().detach().cpu().numpy()
         full = 0.5*torch.ones_like(output)
-        all_one_rates= rate_loss(full, rel, ima, True).flatten().cpu().numpy()
+        all_one_rates= rate_loss(x,full, rel, ima, True).flatten().detach().cpu().numpy()
 
     # beamformer = beamformer.cpu()
 
