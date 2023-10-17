@@ -36,9 +36,9 @@ device = torch.device('cpu')
 bias = True
 dimension = 64
 # 指定训练轮数
-epoch_num = 2000
+epoch_num = 600
 # 指定批大小
-batch_size = 200
+batch_size = 10
 # 指定学习率
 learning_rate = 1e-3
 lambda_lr = 1
@@ -63,7 +63,7 @@ test_B = 4
 train_K = 4
 test_K = 4
 # 训练2
-train_layouts = batch_size * 1
+train_layouts = batch_size * 10
 # 测试集
 test_layouts = 5
 # 模拟路损
@@ -166,11 +166,54 @@ def collate(samples):
 
 # relu = nn.Softplus()
 relu = nn.ReLU()
+
+def caculate_rate(x, beamformer, rel, ima, test_mode = False):
+    
+    beamformer_all = beamformer[:, :, :, 0].float() + 1j * beamformer[:, :, :, 1].float() 
+    # 引入新的association变量
+    beamformer_all = x.squeeze() * beamformer_all
+    # 测试第一个基站不为第一个用户服务
+    # beamformer_all[:,0,0] = 0
+    beamformer_all = norm_func_2(beamformer_all)   
+    channel_all = rel.float() + 1j * ima.float() 
+    B_cur = beamformer.size()[1]
+    K_cur = beamformer.size()[2]
+    batch_cur = rel.shape[0]
+    SINRs_numerators = torch.zeros((batch_cur, K_cur)) 
+    SINRs_denominators = torch.zeros(batch_cur, K_cur) 
+    # 分子，表示有用信号
+    for i in range(0, K_cur):
+            SINRs_numerators[:,i] = torch.squeeze(torch.abs(torch.matmul(beamformer_all[:,:,i].unsqueeze(1), torch.transpose(channel_all[:,:,i].unsqueeze(1),dim0=1,dim1=2))) ** 2)
+    # 分母是干扰波束*自己的信道
+    for i in range(0, K_cur):
+            for j in range(0, K_cur):
+                if(i != j):
+                    SINRs_denominators[:,i] = SINRs_denominators[:,i] + torch.squeeze(torch.abs(torch.matmul(beamformer_all[:,:,j].unsqueeze(1) , torch.transpose(channel_all[:,:,i].unsqueeze(1),dim0=1,dim1=2))) ** 2)
+    SINRs_denominators += var_noise
+    SINRs = SINRs_numerators / SINRs_denominators 
+    rates = torch.log2(1 + SINRs) 
+    sum_rate = torch.sum(rates, dim = 1)  # take sum
+    return rates
+    # return sum_rate
+def caculate_backhaul(rates, sampled_x):
+    B_cur = sampled_x.size()[1]
+    K_cur = sampled_x.size()[2]
+    batch_cur = sampled_x.shape[0]
+    backhaul = torch.zeros(batch_cur,B_cur)
+    # backhaul_x = torch.zeros(batch_cur,B_cur)
+    rates_unsqueeze = rates.unsqueeze(1)
+    sampled_rates = torch.mul(sampled_x, rates_unsqueeze)
+    backhaul = torch.sum(sampled_rates,dim = -1)
+    return backhaul
 # 以上构建完图结构后，下面开始构建图神经网络，这里我们把神经网络的输出看做两个向量拼接成的矩阵，所以维度(:,:,0)表示实部 (:,:,1)表示虚部
 # 根据神经网络的输出（beamformer）和我们固定的信道信息 计算合速率
 def rate_loss(lambda_gnn, x, beamformer, rel, ima, test_mode = False):
     
     x = torch.squeeze(x)
+    # 采样x（量化）将大于0.5的x量化为1
+    sampled_x = sample_x_from_x(x)
+    policy_x = x ** sampled_x
+
     # x = (x > 0.5).float()
     beamformer_all = beamformer[:, :, :, 0].float() + 1j * beamformer[:, :, :, 1].float() 
     # 引入新的association变量
@@ -233,7 +276,7 @@ def rate_loss(lambda_gnn, x, beamformer, rel, ima, test_mode = False):
     zero_rates = torch.zeros_like(rates)
     
     power_cur = torch.norm(beamformer_all[:,:,:].clone(), dim=2,p=2)
-    bs_backhaul = caculate_backhaul_threshold(beamformer_all)
+    
     # sum_rate = sum_rate - torch.sum(x*(1-x)) - torch.sum( 100* torch.abs(backhaul_x-2),dim = 1)
     # sum_rate -= torch.sum( lambda1* torch.abs(backhaul-C_max),dim = 1) +torch.sum( 1000*relu((backhaul-C_max)),dim=1)
     # sum_rate -= torch.sum( 1000*relu((backhaul-C_max)),dim=1)+torch.sum(1000*relu(torch.norm(beamformer_all[:,:,:], dim=1,p=2)-P_max),dim=1)
@@ -250,12 +293,18 @@ def rate_loss(lambda_gnn, x, beamformer, rel, ima, test_mode = False):
     backhaul_constraint =  (backhaul - C)
     # backhaul_constraint = (power_cur - P_max)
     # sum_rate -= backhaul_constraint
+
+    # 用于损失函数的项
+    return_for_policy_gradient = sum_rate * torch.log(1e-10 + policy_x)
     if test_mode:
         return sum_rate
         
     else:
         # return -torch.mean(sum_rate),backhaul_constraint,torch.sum(x*(1-x))
-        return -torch.mean(sum_rate), backhaul_constraint, -100*torch.mean(backhaul_constraint2)
+        return -torch.mean(sum_rate), backhaul_constraint, sum_rate
+def sample_x_from_x(x):
+    sampled_x = torch.multinomial(x,1)
+    return sampled_x
 class CustomMaximum(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, y):
@@ -292,14 +341,6 @@ htanh = Htanh()
 x = torch.tensor([-2.5, -1.6, 0, 3.6, 4.7])
 y = htanh.apply(x)
 print(y)
-def caculate_backhaul(beamformer):
-    backhaul = torch.log(torch.norm((beamformer),dim = 1)/delta+1)/torch.log(torch.tensor(1/delta+1))
-    return backhaul
-def caculate_backhaul_threshold(beamformer):
-    beamformer_norm = torch.norm(beamformer.unsqueeze(-1),dim=-1)
-    after_threshold = (beamformer_norm > 0.01).float()
-    bs_backhaul = torch.sum(after_threshold,dim=(2))
-    return bs_backhaul
 
 # 定义整体的神经网络结构，输入层MLP（将数据转换成APnode、UEnode、edge，维度全是64）->多个中间更新层MLP（保持维度为64）->输出层MLP
 class HetGNN(nn.Module):
@@ -802,7 +843,9 @@ def main():
     #     """ Train for one epoch. """
        
     #     return loss_all2 / len(train_loader.dataset)
-    
+    objective_val = np.zeros(epoch_num)
+
+    # 开始训练，训练epoch_num次
     for epoch in range(0, epoch_num):
         if(epoch % 10 == 1):
             with torch.no_grad():
@@ -821,10 +864,20 @@ def main():
             # 清零上一个batch的梯度
             K = rel.shape[-1] # 6
             bs = len(g.nodes['UE'].data['feat'])//K
-            lambda_gnn,x,output = model(g)
-            
-
-            loss,constraint,loss3 = rate_loss(lambda_gnn, x,output, rel, ima)
+            lambda_gnn,x,beamformer = model(g)
+            x_with_one_minus_x = torch.concat((x,(1-x)),dim = -1)
+            batch_size_cur = x.size()[0]
+            B_cur = x.size()[1]
+            K_cur = x.size()[2]
+            xx = x_with_one_minus_x.view(-1,2)
+            sampled_x = sample_x_from_x(xx)
+            sampled_x = sampled_x.view(batch_size_cur,B_cur,K_cur)
+            # 使用采样后的x计算和速率
+            rates = caculate_rate(sampled_x, beamformer, rel, ima)
+            # 使用采样后的x计算每个基站的backhaul
+            backhaul = caculate_backhaul(rates, sampled_x)
+            # 使用采样后的x计算backhaul
+            loss,constraint,sum_rate = rate_loss(lambda_gnn, x,output, rel, ima)
             # loss.requires_grad_(True)
             # loss.requires_grad_(True)
             # loss2.requires_grad_(True)
@@ -844,18 +897,18 @@ def main():
             # loss.backward(retain_graph=True)
             # loss2.backward(retain_graph=True)
             # loss3.backward()
-            constraint_gap = torch.mean(torch.sum((lambda_now * constraint),dim=1))
-            gap = torch.sum(torch.abs(constraint))
+            constraint_gap = (torch.sum((lambda_now * constraint),dim=1))
+
             # print(constraint_gap)
-            Utility_func = loss + 1*constraint_gap
+            Utility_func = -torch.mean(sum_rate - 1*constraint_gap)
             # lambda_cur.requires_grad=False
             Utility_func.backward()
             
             # 不允许负值
             # perform gradient ascent/descent
             with torch.no_grad():
-                mask = constraint < 0
-                lambda_init2[mask] = 0
+                # mask = constraint < 0
+                # lambda_init2[mask] = 0
                 # lambda_now =  lambda_now  + grad_direct * 1 * 0.01     
                 # lambda_init2[batch_idx*batch_size:(batch_idx+1)*batch_size,:] = lambda_now
             # primal GNN parameters
@@ -882,13 +935,15 @@ def main():
             # lambda_init2.requires_grad = False
             # optimizer.step()    
         # train_rate = train(epoch)
-        if (epoch + 1) % 50 == 0:
-            lambda_lr *= 0.95
+       
+        if (epoch + 1) % 10 == 0:
+            lambda_lr *= 0.9
         # loss_all += loss.item() * bs
         train_rate = loss_all / len(train_loader.dataset)
-        print('Epoch {:03d}, Train Rate: {:.4f}, Constraint Gap: {:.4f}'.format(epoch, train_rate,constraint_gap))
+        objective_val[epoch] = train_rate
+        print('Epoch {:03d}, Train Rate: {:.4f}, Constraint Gap: {:.4f}'.format(epoch, train_rate,torch.mean(constraint_gap)))
         scheduler.step()
-
+    scipy.io.savemat('obj_val.mat',{'obj_val':objective_val})
     # beamformer= torch.zeros()
     ## For CDF Plot
     import matplotlib.pyplot as plt
@@ -930,8 +985,3 @@ def main():
     torch.save(hetgnn_model, 'hetgnn_model.pt')
 if __name__ == '__main__':
     main()
-
-
-
-
-
