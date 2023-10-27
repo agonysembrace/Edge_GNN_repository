@@ -38,10 +38,10 @@ dimension = 64
 # 指定训练轮数
 epoch_num = 600
 # 指定批大小
-batch_size = 10
+batch_size = 3
 # 指定学习率
 learning_rate = 1e-3
-lambda_lr = 1
+lambda_lr = 2
 # 指定高斯白噪声
 var_noise = 1
 # 指定激活函数
@@ -53,7 +53,7 @@ c = 1/np.sqrt(2)
 # PowerBudget /W
 P_max = 1
 # backhaulBudget /bps
-C_max = 3
+C_max = 2
 # sigma
 sigma = var_noise
 # AP数量，单天线 train和test显然是可以不一样的
@@ -63,8 +63,7 @@ test_B = 4
 train_K = 4
 test_K = 4
 # 训练2
-train_layouts = batch_size * 10
-# 测试集
+train_layouts = batch_size * 5
 test_layouts = 5
 # 模拟路损
 beta = 0.6
@@ -201,8 +200,8 @@ def caculate_backhaul(rates, sampled_x):
     batch_cur = sampled_x.shape[0]
     backhaul = torch.zeros(batch_cur,B_cur)
     # backhaul_x = torch.zeros(batch_cur,B_cur)
-    rates_unsqueeze = rates.unsqueeze(1)
-    sampled_rates = torch.mul(sampled_x, rates_unsqueeze)
+    rates_unsqueeze = rates.unsqueeze(1).expand(batch_cur,B_cur,K_cur)
+    sampled_rates = torch.mul(sampled_x.squeeze(), rates_unsqueeze)
     backhaul = torch.sum(sampled_rates,dim = -1)
     return backhaul
 # 以上构建完图结构后，下面开始构建图神经网络，这里我们把神经网络的输出看做两个向量拼接成的矩阵，所以维度(:,:,0)表示实部 (:,:,1)表示虚部
@@ -356,6 +355,7 @@ class HetGNN(nn.Module):
         self.preLayer_x = PreLayer_x() # 预处理层
         self.update_layers_x = nn.ModuleList([UpdateLayer_x()] * 2)  # 更新层，这里使用了2个更新层
         self.postprocess_layer_x = PostLayer_x() # 后处理层
+        self.softmax = nn.Softmax(dim = -1)
     # 输入网络时，节点特征数量为batchsize*AP batchsize*UE，边特征数量为
     def forward(self, graph):
         self.preLayer(graph)
@@ -374,7 +374,9 @@ class HetGNN(nn.Module):
         x = x.view(graph.batch_size,
                             graph.number_of_nodes('AP')//graph.batch_size,
                             graph.number_of_nodes('UE')//graph.batch_size,
-                            -1)
+                            2)
+        x = self.softmax(x)
+
         output_real = output[:,:,:,0]
         output_imag = output[:,:,:,1]
         # P_max = 1
@@ -462,17 +464,10 @@ class MLP_post_x(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(MLP_post_x, self).__init__()
         self.linear1 = nn.Linear(input_dim, output_dim, bias)    
-        self.sigmoid = nn.Sigmoid()
-        self.relu = nn.ReLU()
-        self.tanh = nn.Tanh()
-        self.dropout = nn.Dropout(0.5)
+        self.softmax = nn.Softmax()
     def forward(self, x):
         # x  = self.relu(x)
         x = self.linear1(x)
-        # x = self.tanh(x)
-        x = self.sigmoid(x)
-        # x = htanh.apply(x)
-        x = threshold_fun(x)
         return x    
 def threshold_fun(x):
     return 1./(1+torch.exp(-50*(x-0.5)))
@@ -526,7 +521,7 @@ mlp_update_7 = MLP(dimension*2,dimension)
 
 mlp_post = MLP_post(dimension,2) 
 mlp_post_lambda = MLP_post_lambda(dimension,1) 
-mlp_post_x = MLP_post_x(dimension,1)
+mlp_post_x = MLP_post_x(dimension,2)
 # 预处理层，将初始的节点特征和边特征，进行维度映射
 class PreLayer(nn.Module):
     def __init__(self):
@@ -554,7 +549,7 @@ class PreLayer_x(nn.Module):
 class PostLayer_x(nn.Module):
     def __init__(self):
         super(PostLayer_x, self).__init__()
-        self.post_mlp_x =  MLP_post_x(dimension,1)
+        self.post_mlp_x =  MLP_post_x(dimension,2)
     def forward(self, graph):
         return self.post_mlp_x(graph.edata['x'][('AP','AP2UE','UE')])
 class PostLayer(nn.Module):
@@ -844,20 +839,21 @@ def main():
        
     #     return loss_all2 / len(train_loader.dataset)
     objective_val = np.zeros(epoch_num)
-
+    avg_rates_epoch = []
     # 开始训练，训练epoch_num次
     for epoch in range(0, epoch_num):
-        if(epoch % 10 == 1):
-            with torch.no_grad():
-                # train_rate = train(train_loader)
-                test_rate = test(test_loader)
-            print('Epoch {:03d},  ——————————  Test Rate: {:.4f}'.format(epoch,test_rate))
+        # if(epoch % 10 == 1):
+        #     with torch.no_grad():
+        #         # train_rate = train(train_loader)
+        #         test_rate = test(test_loader)
+        #     print('Epoch {:03d},  ——————————  Test Rate: {:.4f}'.format(epoch,test_rate))
 
         global lambda_init2
         global lambda_lr
         model.train()
         loss_all = 0
         loss_all2 = 0
+        avg_rates_batch = []
         for batch_idx, (g, rel, ima, lambda_init) in enumerate(train_loader):
             model.zero_grad()
 
@@ -870,14 +866,44 @@ def main():
             B_cur = x.size()[1]
             K_cur = x.size()[2]
             xx = x_with_one_minus_x.view(-1,2)
-            sampled_x = sample_x_from_x(xx)
-            sampled_x = sampled_x.view(batch_size_cur,B_cur,K_cur)
-            # 使用采样后的x计算和速率
-            rates = caculate_rate(sampled_x, beamformer, rel, ima)
+            x = x.view(-1,2)
+            all_rates = []
+            avg_rates = []
+            all_sampled_xx = []
+            all_xx = []
+            sample_times = 100
+            ## 对于输出的一个x，对其进行多次的采样
+            for sample_idx in range(0,sample_times):
+                sampled_x = 1-sample_x_from_x(x)
+                sampled_x = sampled_x.view(batch_size_cur,B_cur,K_cur)
+                sampled_xx = torch.concat((sampled_x.unsqueeze(-1),(1-sampled_x.unsqueeze(-1))),dim = -1)
+                # 使用采样后的x计算和速率
+                rates = caculate_rate(sampled_x, beamformer, rel, ima)
+                all_rates.append(rates)
+                all_sampled_xx.append(sampled_xx)
+            # 获取这100次遍历的所有数据，
+            all_rates = torch.stack(all_rates, dim=0)
+            all_sampled_xx = torch.stack(all_sampled_xx, dim=0)
+            avg_rates = torch.mean(all_rates, dim=0) # ergodic average rates
+            all_xx = x.view(batch_size_cur,B_cur,K_cur,2).unsqueeze(0).expand(sample_times,batch_size_cur,B_cur,K_cur,2)
             # 使用采样后的x计算每个基站的backhaul
             backhaul = caculate_backhaul(rates, sampled_x)
-            # 使用采样后的x计算backhaul
-            loss,constraint,sum_rate = rate_loss(lambda_gnn, x,output, rel, ima)
+            sum_rate = torch.sum(all_rates,dim = -1)
+            lambda_now = lambda_init2[batch_idx*batch_size:(batch_idx+1)*batch_size,:]
+            constraint_gap = (torch.sum((lambda_now * (backhaul-C_max)),dim=1))
+            # constraint_gap = (torch.sum((lambda_now * torch.maximum((backhaul-C_max),torch.zeros(1))),dim=1))
+            # 本次采样带来的性能函数具体值-用于策略梯度项
+            func_value_for_policy_gradient = torch.sum(all_rates,dim = (-1)).detach()
+            # ** 表示乘方操作，这里使用采样前的概率为底，采样结果为幂
+
+            # sampled_user_x = (all_xx**all_sampled_xx).view(sample_times,batch_size_cur,-1)
+            sampled_user_x = (all_xx**all_sampled_xx)
+            sampled_user_probability = torch.prod(sampled_user_x.view(sample_times,batch_size_cur,-1),dim = -1)
+            policy_gradient_term = func_value_for_policy_gradient.detach()*torch.log(1e-10+sampled_user_probability)
+            # loss_func = -torch.mean(sum_rate - 10*constraint_gap)  + torch.mean(policy_gradient_term)
+            loss_func = -torch.mean(torch.sum(all_rates,dim = (-1))) - torch.mean(policy_gradient_term)
+            # # 使用采样后的x计算backhaul
+            # loss,constraint,sum_rate = rate_loss(lambda_gnn, x,output, rel, ima)
             # loss.requires_grad_(True)
             # loss.requires_grad_(True)
             # loss2.requires_grad_(True)
@@ -888,7 +914,7 @@ def main():
             # print(loss3)
             # model.zero_grad()
             # lambda_init = 1
-            lambda_now = lambda_init2[batch_idx*batch_size:(batch_idx+1)*batch_size,:]
+            
             # lambda_init2.retain_grad()
 
             # mask = constraint < 0
@@ -897,12 +923,13 @@ def main():
             # loss.backward(retain_graph=True)
             # loss2.backward(retain_graph=True)
             # loss3.backward()
-            constraint_gap = (torch.sum((lambda_now * constraint),dim=1))
+            # constraint_gap = (torch.sum((lambda_now * constraint),dim=1))
 
-            # print(constraint_gap)
-            Utility_func = -torch.mean(sum_rate - 1*constraint_gap)
+            # # print(constraint_gap)
+            # Utility_func = -torch.mean(sum_rate - 1*constraint_gap)
+            loss_func.backward()
             # lambda_cur.requires_grad=False
-            Utility_func.backward()
+            # Utility_func.backward()
             
             # 不允许负值
             # perform gradient ascent/descent
@@ -917,32 +944,27 @@ def main():
                     if theta_main.grad is not None:
                         # print('main', i)
                         theta_main -= learning_rate * theta_main.grad
-                #如果梯度符号和自己的值的符号是一致的，那么就不继续增加lambda了
-                # mask_lambda = (lambda_init2 > 0) * (lambda_init2.grad > 0) + (lambda_init2 < 0) * (lambda_init2.grad < 0)
-                # mask_value = torch.ones_like(lambda_init2)
-                # lambda_init2.grad[mask_lambda] = 0
-                # if (epoch + 1) % 10 == 0:
-                #     lambda_init2 += lambda_lr * lambda_init2.grad
-                lambda_init2 += lambda_lr * lambda_init2.grad
+                # lambda_init2 += lambda_lr * lambda_init2.grad
             lambda_init2.data.clamp_(0)  
             # 清空梯度
             for theta_ in list(model.parameters()) + [lambda_init2]:
                 if theta_.grad is not None:
                     theta_.grad.zero_()
-            loss_all += loss.item() * bs
-            loss_all2 += Utility_func.item() * bs
-            
+            loss_all += torch.mean(all_rates).item()* bs
+            # loss_all2 += loss_func.item() * bs
+            avg_rates_batch.append(torch.mean(sum_rate))
             # lambda_init2.requires_grad = False
             # optimizer.step()    
         # train_rate = train(epoch)
-       
-        if (epoch + 1) % 10 == 0:
+            
+        # avg_rates_epoch.append(np.mean(avg_rates_batch).item())
+        if (epoch + 1) % 50 == 0:
             lambda_lr *= 0.9
         # loss_all += loss.item() * bs
         train_rate = loss_all / len(train_loader.dataset)
         objective_val[epoch] = train_rate
         print('Epoch {:03d}, Train Rate: {:.4f}, Constraint Gap: {:.4f}'.format(epoch, train_rate,torch.mean(constraint_gap)))
-        scheduler.step()
+        # scheduler.step()
     scipy.io.savemat('obj_val.mat',{'obj_val':objective_val})
     # beamformer= torch.zeros()
     ## For CDF Plot
