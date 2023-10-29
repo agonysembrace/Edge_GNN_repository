@@ -60,8 +60,8 @@ sigma = var_noise
 train_B = 4
 test_B = 4
 # UE数量
-train_K = 4
-test_K = 4
+train_K = 2
+test_K = 2
 # 训练2
 train_layouts = batch_size * 5
 test_layouts = 5
@@ -368,8 +368,8 @@ class HetGNN(nn.Module):
         x = x.view(graph.batch_size,
                             graph.number_of_nodes('AP')//graph.batch_size,
                             graph.number_of_nodes('UE')//graph.batch_size,
-                            2)
-        x = self.softmax(x)
+                        )
+        # x = self.softmax(x)
 
         output_real = output[:,:,:,0]
         output_imag = output[:,:,:,1]
@@ -458,10 +458,11 @@ class MLP_post_x(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(MLP_post_x, self).__init__()
         self.linear1 = nn.Linear(input_dim, output_dim, bias)    
-        self.softmax = nn.Softmax()
+        self.sigmoid = nn.Sigmoid()
     def forward(self, x):
         # x  = self.relu(x)
         x = self.linear1(x)
+        x = self.sigmoid(x)
         return x    
 def threshold_fun(x):
     return 1./(1+torch.exp(-50*(x-0.5)))
@@ -515,7 +516,7 @@ mlp_update_7 = MLP(dimension*2,dimension)
 
 mlp_post = MLP_post(dimension,2) 
 mlp_post_lambda = MLP_post_lambda(dimension,1) 
-mlp_post_x = MLP_post_x(dimension,2)
+mlp_post_x = MLP_post_x(dimension,1)
 # 预处理层，将初始的节点特征和边特征，进行维度映射
 class PreLayer(nn.Module):
     def __init__(self):
@@ -760,50 +761,11 @@ def main():
             B_cur = x.size()[1]
             K_cur = x.size()[2]
             # xx = x_with_one_minus_x.view(-1,2)
-            x = x.view(-1,2)
-            all_rates = []
-            avg_rates = []
-            all_sampled_xx = []
-            all_xx = []
-            sample_times = 2
-            ## 对于输出的一个x，对其进行多次的采样
-            for sample_idx in range(0,sample_times):
-                # 因为采样输出下标，所以1减去下标正好表示此处是否是1
-                sampled_x = 1-sample_x_from_x(x)
-                # if(epoch < 100):
-                #     sampled_x = 0*sampled_x.view(batch_size_cur,B_cur,K_cur)+1
-                # else:
-                #     sampled_x = sampled_x.view(batch_size_cur,B_cur,K_cur)
-                sampled_x = sampled_x.view(batch_size_cur,B_cur,K_cur)
-                sampled_xx = torch.concat((sampled_x.unsqueeze(-1),(1-sampled_x.unsqueeze(-1))),dim = -1)
-                # 使用采样后的x计算和速率
-                rates = caculate_rate(sampled_x, beamformer, rel, ima)
-                all_rates.append(rates)
-                all_sampled_xx.append(sampled_xx)
-            # 获取这100次遍历的所有数据，
-            all_rates = torch.stack(all_rates, dim=0)
-            all_sampled_xx = torch.stack(all_sampled_xx, dim=0)
-            avg_rates = torch.mean(all_rates, dim=0) # ergodic average rates
-            all_xx = x.view(batch_size_cur,B_cur,K_cur,2).unsqueeze(0).expand(sample_times,batch_size_cur,B_cur,K_cur,2)
-            # 使用采样后的x计算每个基站的backhaul
-            backhaul = caculate_backhaul(rates, sampled_x)
-            sum_rate = torch.sum(all_rates,dim = -1)
+            rates = caculate_rate(x, beamformer, rel, ima)
+            backhaul = caculate_backhaul(rates, x)
             lambda_now = lambda_init2[batch_idx*batch_size:(batch_idx+1)*batch_size,:]
             constraint_gap = (torch.sum((lambda_now * (backhaul-C_max)),dim=1))
-            # constraint_gap = (torch.sum((lambda_now * torch.maximum((backhaul-C_max),torch.zeros(1))),dim=1))
-            # 本次采样带来的性能函数具体值-用于策略梯度项
-            func_value_for_policy_gradient = torch.sum(all_rates,dim = (-1)).detach()
-            # func_value_for_policy_gradient = torch.sum(all_rates,dim = (-1))
-            # func_value_for_policy_gradient = all_rates.detach()
-            # ** 表示乘方操作，这里使用采样前的概率为底，采样结果为幂
-
-            # sampled_user_x = (all_xx**all_sampled_xx).view(sample_times,batch_size_cur,-1)
-            sampled_user_x = (all_xx**all_sampled_xx)
-            sampled_user_probability = torch.prod(sampled_user_x.view(sample_times,batch_size_cur,-1),dim = -1)
-            policy_gradient_term = func_value_for_policy_gradient.detach()*torch.log(1e-10+sampled_user_probability)
-            # policy_gradient_term = func_value_for_policy_gradient.detach()*sampled_user_probability
-            # loss_func = -torch.mean(sum_rate - 10*constraint_gap)  + torch.mean(policy_gradient_term)
-            loss_func = -torch.mean(torch.sum(all_rates,dim = (-1))) - torch.mean(policy_gradient_term)
+            loss_func = -torch.mean(torch.sum(rates,dim = (-1))) - 100*torch.sum(x*(x-1))
             # print(torch.mean(sampled_user_probability))
             # loss_func = -torch.mean(torch.sum(all_rates,dim = (-1)))
             # # 使用采样后的x计算backhaul
@@ -853,7 +815,7 @@ def main():
             #         theta_.grad.zero_()
             # print(x)
             # print(x.grad)
-            loss_all += torch.mean(torch.sum(all_rates,dim = -1)).item()*bs
+            loss_all += torch.mean(torch.sum(rates,dim = -1)).item()*bs
             loss_all2 += loss_func.item()*bs
             # avg_rates_batch.append(torch.mean(sum_rate))
             ##
