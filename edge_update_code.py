@@ -36,12 +36,12 @@ device = torch.device('cpu')
 bias = True
 dimension = 64
 # 指定训练轮数
-epoch_num = 600
+epoch_num = 300
 # 指定批大小
-batch_size = 2
+batch_size = 1
 # 指定学习率
 learning_rate = 1e-3
-lambda_lr = 2
+lambda_lr = 1
 # 指定高斯白噪声
 var_noise = 1
 # 指定激活函数
@@ -53,7 +53,7 @@ c = 1/np.sqrt(2)
 # PowerBudget /W
 P_max = 1
 # backhaulBudget /bps
-C_max = 2
+C_max = 4
 # sigma
 sigma = var_noise
 # AP数量，单天线 train和test显然是可以不一样的
@@ -63,7 +63,7 @@ test_B = 4
 train_K = 4
 test_K = 4
 # 训练2
-train_layouts = batch_size * 5
+train_layouts = 1
 test_layouts = 5
 # 模拟路损
 beta = 0.6
@@ -692,9 +692,9 @@ hetgnn_model = HetGNN()
 
 model = hetgnn_model
 
-# optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,weight_decay=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,weight_decay=1e-3)
 
-optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate,weight_decay=1e-3)
+# optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate,weight_decay=1e-3)
 # optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate)
 # optimizer = torch.optim.RMSprop(model.parameters(), lr=0.00001)
 
@@ -714,6 +714,15 @@ def test(loader):
     return correct / len(loader.dataset)
 # global lambda_init2
 lambda_init2 = torch.zeros(train_layouts,train_B, requires_grad=True, device=device)
+
+def cal_rate_WMMSE(x, backhaul):
+    batch_size_cur = x.size()[0]
+    B_cur = x.size()[1]
+    K_cur = x.size()[2]
+    # rate = torch.ones(batch_size_cur,B_cur)
+    rate = torch.sum(x,dim = -1)
+    rate[backhaul > C_max] = 0
+    return rate
 def main():
     # 创建数据集，实际上是把训练数据和测试数据构建成图的过程
     train_data = MyDataset(train_channel_rel, train_channel_ima, (train_B, train_K))
@@ -741,7 +750,7 @@ def main():
         #         # train_rate = train(train_loader)
         #         test_rate = test(test_loader)
         #     print('Epoch {:03d},  ——————————  Test Rate: {:.4f}'.format(epoch,test_rate))
-
+        global learning_rate
         global lambda_init2
         global lambda_lr
         model.train()
@@ -762,10 +771,12 @@ def main():
             # xx = x_with_one_minus_x.view(-1,2)
             x = x.view(-1,2)
             all_rates = []
+            all_rates_WMMSE = []
             avg_rates = []
             all_sampled_xx = []
             all_xx = []
-            sample_times = 2
+            all_backhaul = []
+            sample_times = 1
             ## 对于输出的一个x，对其进行多次的采样
             for sample_idx in range(0,sample_times):
                 # 因为采样输出下标，所以1减去下标正好表示此处是否是1
@@ -774,25 +785,35 @@ def main():
                 #     sampled_x = 0*sampled_x.view(batch_size_cur,B_cur,K_cur)+1
                 # else:
                 #     sampled_x = sampled_x.view(batch_size_cur,B_cur,K_cur)
+                sampled_x = 0*sampled_x.view(batch_size_cur,B_cur,K_cur)+1
                 sampled_x = sampled_x.view(batch_size_cur,B_cur,K_cur)
                 sampled_xx = torch.concat((sampled_x.unsqueeze(-1),(1-sampled_x.unsqueeze(-1))),dim = -1)
                 # 使用采样后的x计算和速率
                 rates = caculate_rate(sampled_x, beamformer, rel, ima)
+                
                 all_rates.append(rates)
-                all_sampled_xx.append(sampled_xx)
+                backhaul = caculate_backhaul(rates, sampled_x)
+                WMMSE_rates = cal_rate_WMMSE(sampled_x,backhaul)
+                all_backhaul.append(backhaul)
+                all_rates_WMMSE.append(WMMSE_rates)
+                all_sampled_xx.append(sampled_xx) 
             # 获取这100次遍历的所有数据，
             all_rates = torch.stack(all_rates, dim=0)
+            all_rates_WMMSE = torch.stack(all_rates_WMMSE,dim = 0)
             all_sampled_xx = torch.stack(all_sampled_xx, dim=0)
             avg_rates = torch.mean(all_rates, dim=0) # ergodic average rates
             all_xx = x.view(batch_size_cur,B_cur,K_cur,2).unsqueeze(0).expand(sample_times,batch_size_cur,B_cur,K_cur,2)
+            all_backhaul = torch.stack(all_backhaul, dim = 0)
             # 使用采样后的x计算每个基站的backhaul
             backhaul = caculate_backhaul(rates, sampled_x)
             sum_rate = torch.sum(all_rates,dim = -1)
             lambda_now = lambda_init2[batch_idx*batch_size:(batch_idx+1)*batch_size,:]
+            # 将滞后的lambda清零
+            # lambda_now[backhaul < C_max] = 0
             constraint_gap = (torch.sum((lambda_now * (backhaul-C_max)),dim=1))
             # constraint_gap = (torch.sum((lambda_now * torch.maximum((backhaul-C_max),torch.zeros(1))),dim=1))
             # 本次采样带来的性能函数具体值-用于策略梯度项
-            func_value_for_policy_gradient = torch.sum(all_rates,dim = (-1)).detach()
+            func_value_for_policy_gradient = torch.sum(all_rates_WMMSE,dim = (-1)).detach()
             # func_value_for_policy_gradient = torch.sum(all_rates,dim = (-1))
             # func_value_for_policy_gradient = all_rates.detach()
             # ** 表示乘方操作，这里使用采样前的概率为底，采样结果为幂
@@ -803,7 +824,8 @@ def main():
             policy_gradient_term = func_value_for_policy_gradient.detach()*torch.log(1e-10+sampled_user_probability)
             # policy_gradient_term = func_value_for_policy_gradient.detach()*sampled_user_probability
             # loss_func = -torch.mean(sum_rate - 10*constraint_gap)  + torch.mean(policy_gradient_term)
-            loss_func = -torch.mean(torch.sum(all_rates,dim = (-1))) - torch.mean(policy_gradient_term)
+            loss_func = -torch.mean(torch.sum(all_rates,dim = (-1)) - 1*constraint_gap) 
+            # loss_func = -torch.mean(torch.sum(all_rates,dim = (-1))- 1*constraint_gap) - torch.mean(policy_gradient_term)
             # print(torch.mean(sampled_user_probability))
             # loss_func = -torch.mean(torch.sum(all_rates,dim = (-1)))
             # # 使用采样后的x计算backhaul
@@ -819,7 +841,7 @@ def main():
             # model.zero_grad()
             # lambda_init = 1
             
-            # lambda_init2.retain_grad()
+            lambda_init2.retain_grad()
 
             # mask = constraint < 0
             # grad_direct = torch.ones_like(lambda_now)
@@ -839,18 +861,19 @@ def main():
             # perform gradient ascent/descent
 
             ##
-            # with torch.no_grad():
-            # # primal GNN parameters
-            #     for i, theta_main in enumerate(list(model.parameters())):
-            #         # theta_main += lr_main * torch.clamp(dtheta_main[i], min=-1, max=1)
-            #         if theta_main.grad is not None:
-            #             theta_main -= learning_rate * theta_main.grad
-            #     # lambda_init2 += lambda_lr * lambda_init2.grad
-            # lambda_init2.data.clamp_(0)  
+            with torch.no_grad():
+            # primal GNN parameters
+                for i, theta_main in enumerate(list(model.parameters())):
+                    # theta_main += lr_main * torch.clamp(dtheta_main[i], min=-1, max=1)
+                    if theta_main.grad is not None:
+                        theta_main -= learning_rate * theta_main.grad
+                lambda_init2 += lambda_lr * lambda_init2.grad
+            lambda_init2.data.clamp_(0)  
+            lambda_init2.grad.zero_()
             # # 清空梯度
-            # for theta_ in list(model.parameters()) + [lambda_init2]:
-            #     if theta_.grad is not None:
-            #         theta_.grad.zero_()
+            for theta_ in list(model.parameters()) + [lambda_init2]:
+                if theta_.grad is not None:
+                    theta_.grad.zero_()
             # print(x)
             # print(x.grad)
             loss_all += torch.mean(torch.sum(all_rates,dim = -1)).item()*bs
@@ -860,18 +883,21 @@ def main():
             # print(torch.mean(torch.sum(all_rates,dim = -1)).item())
 
             # lambda_init2.requires_grad = False
-            optimizer.step()    
-        # train_rate = train(epoch)
+            # optimizer.step()    
             
+        # train_rate = train(epoch)
+        
         # avg_rates_epoch.append(np.mean(avg_rates_batch).item())
-        if (epoch + 1) % 50 == 0:
-            lambda_lr *= 0.5
+        if (epoch + 1) % 10 == 0:
+            # lambda_lr *= 0.5
+            learning_rate *= 0.8
         # loss_all += loss.item() * bs
         train_rate = loss_all / len(train_loader.dataset)
         loss_val = loss_all2 / len(train_loader.dataset)
         objective_val[epoch] = train_rate
         print('Epoch {:03d}, Train Rate: {:.4f}, Loss :{:.4f}, Constraint Gap: {:.4f}'.format(epoch, train_rate, loss_val,  torch.mean(constraint_gap)))
-        scheduler.step()
+        print(backhaul)
+        # scheduler.step()
     scipy.io.savemat('obj_val.mat',{'obj_val':objective_val})
     # beamformer= torch.zeros()
     ## For CDF Plot
