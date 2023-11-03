@@ -38,10 +38,10 @@ dimension = 64
 # 指定训练轮数
 epoch_num = 600
 # 指定批大小
-batch_size = 2
+batch_size = 1
 # 指定学习率
 learning_rate = 1e-3
-lambda_lr = 2
+lambda_lr = 1
 # 指定高斯白噪声
 var_noise = 1
 # 指定激活函数
@@ -63,7 +63,7 @@ test_B = 4
 train_K = 2
 test_K = 2
 # 训练2
-train_layouts = batch_size * 5
+train_layouts = batch_size * 1
 test_layouts = 5
 # 模拟路损
 beta = 0.6
@@ -166,17 +166,12 @@ def collate(samples):
 # relu = nn.Softplus()
 relu = nn.ReLU()
 
-def caculate_rate(x, beamformer, rel, ima, test_mode = False):
+def caculate_rate(x, beamformer_all, rel, ima, test_mode = False):
     
-    beamformer_all = beamformer[:, :, :, 0].float() + 1j * beamformer[:, :, :, 1].float() 
-    # 引入新的association变量
-    beamformer_all = x.squeeze() * beamformer_all
-    # 测试第一个基站不为第一个用户服务
-    # beamformer_all[:,0,0] = 0
-    beamformer_all = norm_func_2(beamformer_all)   
+     
     channel_all = rel.float() + 1j * ima.float() 
-    B_cur = beamformer.size()[1]
-    K_cur = beamformer.size()[2]
+    B_cur = beamformer_all.size()[1]
+    K_cur = beamformer_all.size()[2]
     batch_cur = rel.shape[0]
     SINRs_numerators = torch.zeros((batch_cur, K_cur)) 
     SINRs_denominators = torch.zeros(batch_cur, K_cur) 
@@ -194,15 +189,22 @@ def caculate_rate(x, beamformer, rel, ima, test_mode = False):
     sum_rate = torch.sum(rates, dim = 1)  # take sum
     return rates
     # return sum_rate
-def caculate_backhaul(rates, sampled_x):
+def caculate_backhaul(rates, sampled_x, beamformer_all):
     B_cur = sampled_x.size()[1]
     K_cur = sampled_x.size()[2]
     batch_cur = sampled_x.shape[0]
     backhaul = torch.zeros(batch_cur,B_cur)
     # backhaul_x = torch.zeros(batch_cur,B_cur)
+    beamformer_all = beamformer_all.view(-1)
+    beamformer_x = torch.zeros_like(beamformer_all)
+    for i in range(0,beamformer_all.size()[0]):
+        beamformer_x[i] = torch.norm(beamformer_all[i],2)
+    beamformer_x = torch.real(beamformer_x.view(batch_cur, B_cur, K_cur))
+    beamformer_x = threshold_fun(beamformer_x)
     rates_unsqueeze = rates.unsqueeze(1).expand(batch_cur,B_cur,K_cur)
-    sampled_rates = torch.mul(sampled_x.squeeze(), rates_unsqueeze)
-    backhaul = torch.sum(sampled_rates,dim = -1)
+    
+    backhaul = torch.sum(rates_unsqueeze*beamformer_x,dim = -1)
+    backhaul = torch.sum(rates_unsqueeze*sampled_x,dim = -1)
     return backhaul
 # 以上构建完图结构后，下面开始构建图神经网络，这里我们把神经网络的输出看做两个向量拼接成的矩阵，所以维度(:,:,0)表示实部 (:,:,1)表示虚部
 # 根据神经网络的输出（beamformer）和我们固定的信道信息 计算合速率
@@ -693,13 +695,13 @@ hetgnn_model = HetGNN()
 
 model = hetgnn_model
 
-# optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,weight_decay=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,weight_decay=1e-3)
 
-optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate,weight_decay=1e-3)
+# optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate,weight_decay=1e-3)
 # optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate)
 # optimizer = torch.optim.RMSprop(model.parameters(), lr=0.00001)
 
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+# scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.8)
 
 def test(loader):
     model.eval()
@@ -716,6 +718,7 @@ def test(loader):
 # global lambda_init2
 lambda_init2 = torch.zeros(train_layouts,train_B, requires_grad=True, device=device)
 def main():
+    global learning_rate
     # 创建数据集，实际上是把训练数据和测试数据构建成图的过程
     train_data = MyDataset(train_channel_rel, train_channel_ima, (train_B, train_K))
     test_data = MyDataset(test_channel_rel, test_channel_ima,  (test_B, test_K))
@@ -756,16 +759,21 @@ def main():
             K = rel.shape[-1] # 6
             bs = len(g.nodes['UE'].data['feat'])//K
             lambda_gnn,x,beamformer = model(g)
+            beamformer_all = beamformer[:, :, :, 0].float() + 1j * beamformer[:, :, :, 1].float() 
+
+            beamformer_all = norm_func_2(beamformer_all)
             # x_with_one_minus_x = torch.concat((x,(1-x)),dim = -1)
+            x = 0*x +1
             batch_size_cur = x.size()[0]
             B_cur = x.size()[1]
             K_cur = x.size()[2]
             # xx = x_with_one_minus_x.view(-1,2)
-            rates = caculate_rate(x, beamformer, rel, ima)
-            backhaul = caculate_backhaul(rates, x)
+            rates = caculate_rate(x, beamformer_all, rel, ima)
+            backhaul = caculate_backhaul(rates, x, beamformer_all)
             lambda_now = lambda_init2[batch_idx*batch_size:(batch_idx+1)*batch_size,:]
             constraint_gap = (torch.sum((lambda_now * (backhaul-C_max)),dim=1))
-            loss_func = -torch.mean(torch.sum(rates,dim = (-1))) - 100*torch.sum(x*(x-1))
+            # loss_func = -torch.mean(torch.sum(rates,dim = (-1))) - 100*torch.sum(x*(x-1))
+            loss_func = -torch.mean(torch.sum(rates,dim = (-1)) - constraint_gap)
             # print(torch.mean(sampled_user_probability))
             # loss_func = -torch.mean(torch.sum(all_rates,dim = (-1)))
             # # 使用采样后的x计算backhaul
@@ -790,7 +798,7 @@ def main():
             # loss2.backward(retain_graph=True)
             # loss3.backward()
             # constraint_gap = (torch.sum((lambda_now * constraint),dim=1))
-            x.retain_grad()
+            # x.retain_grad()
             # # print(constraint_gap)
             # Utility_func = -torch.mean(sum_rate - 1*constraint_gap)
             loss_func.backward()
@@ -801,18 +809,19 @@ def main():
             # perform gradient ascent/descent
 
             ##
-            # with torch.no_grad():
+            with torch.no_grad():
             # # primal GNN parameters
             #     for i, theta_main in enumerate(list(model.parameters())):
             #         # theta_main += lr_main * torch.clamp(dtheta_main[i], min=-1, max=1)
             #         if theta_main.grad is not None:
             #             theta_main -= learning_rate * theta_main.grad
-            #     # lambda_init2 += lambda_lr * lambda_init2.grad
-            # lambda_init2.data.clamp_(0)  
+                lambda_init2 += lambda_lr * lambda_init2.grad
+            lambda_init2.data.clamp_(0)  
             # # 清空梯度
             # for theta_ in list(model.parameters()) + [lambda_init2]:
             #     if theta_.grad is not None:
             #         theta_.grad.zero_()
+            lambda_init2.grad.zero_()
             # print(x)
             # print(x.grad)
             loss_all += torch.mean(torch.sum(rates,dim = -1)).item()*bs
@@ -826,14 +835,15 @@ def main():
         # train_rate = train(epoch)
             
         # avg_rates_epoch.append(np.mean(avg_rates_batch).item())
-        if (epoch + 1) % 50 == 0:
-            lambda_lr *= 0.5
+        if (epoch + 1) % 10 == 0:
+            lambda_lr *= 0.9
+            learning_rate *= 0.8
         # loss_all += loss.item() * bs
         train_rate = loss_all / len(train_loader.dataset)
         loss_val = loss_all2 / len(train_loader.dataset)
         objective_val[epoch] = train_rate
         print('Epoch {:03d}, Train Rate: {:.4f}, Loss :{:.4f}, Constraint Gap: {:.4f}'.format(epoch, train_rate, loss_val,  torch.mean(constraint_gap)))
-        scheduler.step()
+        # scheduler.step()
     scipy.io.savemat('obj_val.mat',{'obj_val':objective_val})
     # beamformer= torch.zeros()
     ## For CDF Plot
