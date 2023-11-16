@@ -36,9 +36,9 @@ device = torch.device('cpu')
 bias = True
 dimension = 64
 # 指定训练轮数
-epoch_num = 600
+epoch_num = 30
 # 指定批大小
-batch_size = 100000
+batch_size = 100
 # 指定学习率
 learning_rate = 1e-3
 lambda_lr = 1
@@ -63,8 +63,8 @@ test_B = 4
 train_K = 4
 test_K = 4
 # 训练2
-train_layouts = 10
-test_layouts = 200
+train_layouts = 1000
+test_layouts = 50
 # 模拟路损
 beta = 0.6
 
@@ -83,8 +83,9 @@ test_channel_rel = beta * np.random.randn(test_layouts, test_B, test_K)
 test_channel_ima = beta * np.random.randn(test_layouts, test_B, test_K)
 # lambda_init = torch.zeros(train_layouts, train_B)
 train_Cmax = 5*np.random.rand(train_layouts, train_B)
+train_Cmax = 4*np.ones((train_layouts, train_B))
 test_Cmax = 5*np.random.rand(test_layouts, test_B)
-
+test_Cmax = 4*np.ones((test_layouts, test_B))
 scipy.io.savemat('train_channel_1112.mat',{'train_channel_rel':train_channel_rel, 'train_channel_ima': train_channel_ima})
 scipy.io.savemat('train_backhaul_1112.mat',{'train_Cmax':train_Cmax})
 scipy.io.savemat('test_channel_1112.mat',{'test_channel_rel':test_channel_rel, 'test_channel_ima': test_channel_ima})
@@ -736,6 +737,8 @@ def cal_rate_WMMSE(x, backhaul):
     rate = (torch.sum(x,dim = -1))
     # rate[backhaul > C_max] = 0
     return x
+# def backhaul_promise(Cmax, rates):
+
 def main():
     # 创建数据集，实际上是把训练数据和测试数据构建成图的过程
     train_data = MyDataset(train_channel_rel, train_channel_ima, (train_B, train_K), train_Cmax)
@@ -757,7 +760,7 @@ def main():
     objective_val = np.zeros(epoch_num)
     avg_rates_epoch = []
     # 开始训练，训练epoch_num次
-    AAAA = torch.randint(2, (10, 4, 4))
+    AAAA = torch.randint(2, (train_layouts, train_B, train_K))
     for epoch in range(0, epoch_num):
         # if(epoch % 10 == 1):
         #     with torch.no_grad():
@@ -792,7 +795,7 @@ def main():
             all_sampled_x = []
             all_xx = []
             all_backhaul = []
-            sample_times = 20
+            sample_times = 100
             threshold_epoch = 1
             if(epoch == threshold_epoch):
                 sampled_x_ones = 1-sample_x_from_x(x).detach()
@@ -800,13 +803,14 @@ def main():
             for sample_idx in range(0,sample_times):
                 # 因为采样输出下标，所以1减去下标正好表示此处是否是1
                 sampled_x = 1-sample_x_from_x(x)
-                sampled_x = AAAA
+                # sampled_x = AAAA
                 # if(epoch < 100):
                 #     sampled_x = 0*sampled_x.view(batch_size_cur,B_cur,K_cur)+1
                 # else:
                 #     sampled_x = sampled_x.view(batch_size_cur,B_cur,K_cur)
                 # sampled_x = 0*sampled_x.view(batch_size_cur,B_cur,K_cur)+1
-                # sampled_x[:,1,:] = 0
+                # sampled_x = AAAA
+                # sampled_x[5,1:3,1:2] = 0
                 # if(epoch > threshold_epoch):
                 #     sampled_x = 0*sampled_x.view(batch_size_cur,B_cur,K_cur)+1
                 sampled_x = sampled_x.view(batch_size_cur,B_cur,K_cur)
@@ -854,12 +858,15 @@ def main():
             sampled_user_probability = torch.prod(sampled_user_x.view(sample_times,batch_size_cur,train_B,train_K, -1),dim = -1)
             sampled_user_probability = torch.prod(sampled_user_x.view(sample_times,batch_size_cur,-1),dim = -1)
             policy_gradient_term = func_value_for_policy_gradient.detach()*torch.log(1e-10+sampled_user_probability)
+            # policy_gradient_term = torch.log(1e-10+sampled_user_probability)
+
             # policy_gradient_term = func_value_for_policy_gradient.detach()*torch.log(1e-10+sampled_user_probability)
             # policy_gradient_term = func_value_for_policy_gradient.detach()*sampled_user_probability
             # loss_func = -torch.mean(sum_rate - 10*constraint_gap)  + torch.mean(policy_gradient_term)
             # loss_func = -torch.mean(torch.sum(all_rates,dim = (-1)) - 1*constraint_gap) 
             loss_func = -torch.mean(torch.sum(avg_rates,dim = (-1))- 1*constraint_gap) - torch.mean(policy_gradient_term)
             # loss_func =  -torch.mean(policy_gradient_term)
+            # loss_func = torch.sum(torch.abs(sampled_xx - x.view(sampled_xx.shape)))
             # loss_func = torch.sum(x[:,1])-torch.sum(x[:,0])
             # f = func_value_for_policy_gradient.type(torch.float64)
             # print(all_sampled_x)
@@ -900,21 +907,21 @@ def main():
             
             # 不允许负值
             # perform gradient ascent/descent
-            print(x.grad)
+            # print(x.grad)
             ##
             with torch.no_grad():
-            # # # primal GNN parameters
-            # #     for i, theta_main in enumerate(list(model.parameters())):
-            # #         # theta_main += lr_main * torch.clamp(dtheta_main[i], min=-1, max=1)
-            # #         if theta_main.grad is not None:
-            # #             theta_main -= learning_rate * theta_main.grad
+            # primal GNN parameters
+                # for i, theta_main in enumerate(list(model.parameters())):
+                #     # theta_main += lr_main * torch.clamp(dtheta_main[i], min=-1, max=1)
+                #     if theta_main.grad is not None:
+                #         theta_main -= learning_rate * theta_main.grad
                 lambda_init2 += lambda_lr * lambda_init2.grad
             lambda_init2.data.clamp_(0)  
             lambda_init2.grad.zero_()
             ##
 
 
-            # # # 清空梯度
+            # # 清空梯度
             # for theta_ in list(model.parameters()) + [lambda_init2]:
             #     if theta_.grad is not None:
             #         theta_.grad.zero_()
@@ -959,9 +966,16 @@ def main():
         sampled_x = 1-sample_x_from_x(x)   
         sampled_x = sampled_x.view(batch_size_cur,B_cur,K_cur)
         rates = caculate_rate(sampled_x, beamformer, rel, ima)
-        # 使用采样后的x计算和速率
-        gnn_rates = torch.sum(rates,dim = -1).detach()
         backhaul = caculate_backhaul(rates, sampled_x)
+        # 以下操作用于超出backhaul约束时，缩小rate
+        gap = (backhaul-Cmax)
+        gap_mask = gap<0
+        gap[gap_mask] = 0
+        constraint_gap = (torch.sum(gap,dim=1))
+        sum_rates = torch.sum(rates,dim = 1) - constraint_gap
+        # 使用采样后的x计算和速率
+        gnn_rates = sum_rates.detach()
+        
         # print(output)
         scipy.io.savemat('test_backhaul.mat',{'Cmax':Cmax.detach().numpy(),'backhaul':backhaul.detach().numpy()})
         # all_one_rates= rate_loss(x,full, rel, ima, True).flatten().detach().cpu().numpy()
